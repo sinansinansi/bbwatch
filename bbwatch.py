@@ -2,9 +2,24 @@
 """
 bbwatch - breadth-first bug bounty change monitor.
 
-Pulls the public scope dumps from arkadiyt/bounty-targets-data (refreshed ~every 30 min)
-for HackerOne, Bugcrowd, Intigriti and YesWeHack, diffs them against the last snapshot,
-and pushes what changed, most useful first.
+Reads every public program on HackerOne, Bugcrowd, Intigriti and YesWeHack each run, diffs
+scope and policy against the last snapshot, and pushes what changed, most useful first.
+
+Sources (each platform's own API first; the arkadiyt/bounty-targets-data feed is the fallback
+when a direct source fails, and switching source re-baselines that platform silently):
+  HackerOne   Hacker API (H1_USERNAME/H1_TOKEN): program list with policy text and open/paused
+              status every run; structured scopes of open programs at 1 req/s within a 5-minute
+              budget, stopping at the first 429 (H1 limits well below its documented 600/min):
+              programs whose feed scope just changed first, then least recently refreshed
+              (40-100 per run observed); scope exclusions when the policy text changed
+              or every 6h
+  Bugcrowd    public engagement JSON: bug bounties and VDPs (the feed has no VDPs). Every run
+              checks each engagement's latest changelog id and announcements; a new id fetches
+              the brief version: targets per reward group, reward ranges, VRT exclusion rules
+  Intigriti   researcher API (INTIGRITI_TOKEN): scope with tiers and rules of engagement,
+              re-fetched when its activity log says so; public list as fallback
+  YesWeHack   public API: every program's detail each run (scope with asset value levels,
+              rules, (non-)qualifying vulnerabilities, reward grids)
 
 Positive signals (pushed with sound):
   NEW_PROGRAM       new public program (includes private -> public launches)
@@ -12,60 +27,59 @@ Positive signals (pushed with sound):
   OOS_TO_IN_SCOPE   something that was out of scope is now in scope
   NEW_WILDCARD      new *.domain asset
   NEW_ASSET_TYPE    first asset of a type the program never had (first API, first mobile app...)
-  REOPENED          program came back after being paused/removed
-  ASSET_NOW_PAID    existing asset became bounty-eligible (H1, Intigriti)
+  REOPENED          program came back after a pause (Intigriti/H1: after >= 3 days suspended)
+  ASSET_NOW_PAID    existing asset became bounty-eligible (H1 flag, Intigriti tier, Bugcrowd
+                    reward group, YesWeHack asset value grid)
   NEW_ASSET         any other new in-scope asset
   OOS_REMOVED       out-of-scope exclusion dropped
-  ASSET_TIER_UP     Intigriti asset moved to a better-paying tier
-  BOUNTY_UP         max bounty raised (not H1: its feed has no amounts)
-
-  Policy (YesWeHack, from its public API):
+  ASSET_TIER_UP     asset moved to a better-paying Intigriti tier / Bugcrowd reward group /
+                    YesWeHack asset value
+  BOUNTY_UP         max bounty raised (not H1: its API has no amounts)
   EXCLUSION_REMOVED a non-qualifying vulnerability class was dropped (it pays now)
-  QUALIFYING_ADDED  new qualifying vulnerability class
-  REWARD_UP         a cell of the reward grid went up
-  POLICY_CHANGED    rules / account-access text changed (shows added lines)
-  PROGRAM_UPDATED   Intigriti says the program was edited, but the public API doesn't say what
+  QUALIFYING_ADDED  new qualifying vulnerability class (YesWeHack)
+  REWARD_UP         a reward grid / reward range cell went up (YesWeHack, Bugcrowd)
+  POLICY_CHANGED    policy text changed: shows added (+) and removed (-) lines, since
+                    exclusions are often bullet points that simply disappear
+  ANNOUNCEMENT      new Bugcrowd program announcement
+  PROGRAM_UPDATED   Intigriti (no token) says the program was edited, without saying what
 
 Negative signals (one silent digest push per run):
   PAUSED, PAUSED_OR_REMOVED, PAID_TO_VDP, BOUNTY_DOWN, ASSET_REMOVED, ASSET_NO_LONGER_PAID,
   ASSET_TIER_DOWN, OOS_ADDED, EXCLUSION_ADDED, QUALIFYING_REMOVED, REWARD_DOWN
 
-The feed only lists open programs, so a paused program simply disappears. Disappeared
-programs are remembered in state["gone"]; they are reported after GONE_GRACE_HOURS (to ride
-out feed glitches) and reported as REOPENED if they come back after that.
+WARNING pushes mean bbwatch itself needs attention: a source failing several runs in a row,
+an expired token, Bugcrowd answering 403/429, or the fallback feed not changing for a day.
 
-Intigriti and YesWeHack also have public program lists (no account needed). Those are read
-directly every run. They give the real open/suspended status, programs the feed skips
-(Intigriti programs that need login or T&C acceptance) and, for YesWeHack, the full policy,
-fetched only when a program's last_update_at changes. For those two platforms the list is
-the authority on pauses, so the feed's disappearance guess is not alerted.
+Bugcrowd has no pause status, so a Bugcrowd program that disappears is reported after
+GONE_GRACE_HOURS (to ride out glitches) and as REOPENED if it comes back.
 
-Tags: [AI] for GenAI-looking assets/text, [BONUS] for policy text mentioning bonuses or
-promotions. Both always push at high priority.
-
-Anything that looks GenAI-related (HackerOne AI_MODEL assets, chat/llm/agent/copilot keywords)
-is tagged [AI] so the LLM-testing track can filter on it.
+Tags: [AI] for GenAI-looking assets/text (HackerOne AI_MODEL assets, chat/llm/agent/copilot
+keywords), [BONUS] for policy text mentioning bonuses or promotions. Both push at high priority.
 
 Stdlib only. Config through env vars:
   BBWATCH_STATE        path to snapshot file          (default: state.json next to script)
   BBWATCH_REPORT_DIR   where markdown reports go      (default: reports/ next to script)
   BBWATCH_MIN_BOUNTY   ignore programs whose max bounty is below this (default 0)
-  BBWATCH_BOUNTY_ONLY  "1" to drop programs that pay nothing
+  BBWATCH_BOUNTY_ONLY  "1" to drop programs that pay nothing (also skips Bugcrowd VDPs)
   NTFY_TOPIC           ntfy.sh topic for phone push (optional, no account needed)
   NTFY_SERVER          self-hosted ntfy server        (default: https://ntfy.sh)
   NTFY_MAX             max pushes per run             (default 15)
   DISCORD_WEBHOOK      Discord webhook URL (optional)
   TELEGRAM_TOKEN / TELEGRAM_CHAT_ID   Telegram bot alerts (optional)
   BBWATCH_DIRECT       "0" to skip the direct platform APIs (default on, off with LOCAL_FEED)
+  BBWATCH_H1_RPS / BBWATCH_BC_RPS / BBWATCH_YWH_RPS   request pacing per platform
 """
 import base64
 import difflib
+import hashlib
 import html
 import json
 import os
 import re
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -137,12 +151,33 @@ QUIET = {k for k, (rank, _) in KINDS.items() if rank == 10}
 # --------------------------------------------------------------------------- fetch
 
 def fetch(platform):
+    """Returns (parsed feed, raw bytes)."""
     if LOCAL_FEED_DIR:
-        with open(Path(LOCAL_FEED_DIR) / f"{platform}.json", encoding="utf-8") as f:
-            return json.load(f)
-    req = urllib.request.Request(FEED.format(platform), headers={"User-Agent": "bbwatch"})
-    with urllib.request.urlopen(req, timeout=120) as r:
-        return json.loads(r.read().decode("utf-8"))
+        raw = (Path(LOCAL_FEED_DIR) / f"{platform}.json").read_bytes()
+    else:
+        req = urllib.request.Request(FEED.format(platform), headers={"User-Agent": "bbwatch"})
+        with urllib.request.urlopen(req, timeout=120) as r:
+            raw = r.read()
+    return json.loads(raw.decode("utf-8")), raw
+
+
+FEED_STALE = timedelta(hours=24)
+
+
+def check_feed(state, fetched, digest, now):
+    """Warns when feed downloads keep failing, or the feed stops changing (it normally updates
+    every 30 minutes, so a day without any change means its scraper is down)."""
+    for plat in PLATFORMS:
+        health(state, f"scope feed ({plat})", plat in fetched, "Download failing.")
+    if not fetched:
+        return
+    f = state.setdefault("feed", {})
+    if f.get("digest") != digest:
+        f.update(digest=digest, changed=now.isoformat(timespec="seconds"), warned=False)
+    elif now - datetime.fromisoformat(f["changed"]) > FEED_STALE and not f.get("warned"):
+        f["warned"] = True
+        WARNINGS.append(f'Scope feed (bounty-targets-data) unchanged since {f["changed"][:16]} UTC. '
+                        f"Its scraper may be down; feed-only programs won't show scope changes.")
 
 
 # --------------------------------------------------------------------------- normalize
@@ -162,8 +197,13 @@ def _money(v):
         return 0.0
 
 
-def _asset(typ, bounty=None, tier=None):
-    return {"type": (typ or "").lower(), "bounty": bounty, "tier": tier}
+def _asset(typ, bounty=None, tier=None, pay=None, level=None):
+    """tier: Intigriti tier (1 pays most). pay/level: the best reward that applies to this asset
+    and the name of where it comes from (Bugcrowd reward group, YesWeHack asset value)."""
+    a = {"type": (typ or "").lower(), "bounty": bounty, "tier": tier}
+    if pay is not None:
+        a.update(pay=pay, level=level)
+    return a
 
 
 def norm_hackerone(p):
@@ -241,15 +281,16 @@ NORMALIZERS = {"hackerone": norm_hackerone, "bugcrowd": norm_bugcrowd,
 
 
 def snapshot():
-    """Returns ({key: program}, set of platforms fetched successfully)."""
-    snap, ok = {}, set()
+    """Returns ({key: program}, set of platforms fetched successfully, digest of all raw feeds)."""
+    snap, ok, digest = {}, set(), hashlib.sha256()
     for plat in PLATFORMS:
         try:
-            raw = fetch(plat)
+            raw, body = fetch(plat)
         except Exception as e:  # one platform failing shouldn't kill the run
             print(f"[!] {plat}: {e}", file=sys.stderr)
             continue
         ok.add(plat)
+        digest.update(body)
         for p in raw:
             try:
                 key, prog = NORMALIZERS[plat](p)
@@ -257,9 +298,11 @@ def snapshot():
                 print(f"[!] {plat}: skipped malformed program ({e})", file=sys.stderr)
                 continue
             prog["platform"] = plat
-            prog["oos"] = sorted(set(prog["oos"]))
+            prog["src"] = "feed"
+            prog["assets"] = {k.strip(): v for k, v in prog["assets"].items() if k.strip()}
+            prog["oos"] = sorted({x.strip() for x in prog["oos"] if x.strip()})
             snap[f"{plat}:{key}"] = prog
-    return snap, ok
+    return snap, ok, digest.hexdigest()
 
 
 # --------------------------------------------------------------------------- state
@@ -378,6 +421,12 @@ def diff_program(key, o, n, out):
             up = info["tier"] < before["tier"]
             add("ASSET_TIER_UP" if up else "ASSET_TIER_DOWN",
                 f'{a}  tier {before["tier"]} -> {info["tier"]}', up and is_ai(a, typ))
+        elif info.get("pay") and before.get("pay") and info["pay"] != before["pay"]:
+            # Bugcrowd reward group / YesWeHack asset value moved
+            up = info["pay"] > before["pay"]
+            add("ASSET_TIER_UP" if up else "ASSET_TIER_DOWN",
+                f'{a}  {before.get("level")} (max {before["pay"]:g}) -> {info.get("level")} (max {info["pay"]:g})',
+                up and is_ai(a, typ))
     for a in o["assets"]:
         if a not in n["assets"]:
             add("ASSET_REMOVED", a)
@@ -404,7 +453,8 @@ def diff(state, new, fetched, now, authoritative=frozenset()):
             if wanted(n):
                 if g["alerted"] and n["platform"] not in authoritative:
                     out.add("REOPENED", key, n, f'gone since {g["since"][:10]}', program_is_ai(n))
-                diff_program(key, g["prog"], n, out)  # catch scope changes made while away
+                if g["prog"].get("src") == n.get("src"):
+                    diff_program(key, g["prog"], n, out)  # catch scope changes made while away
         elif key not in seen and wanted(n):
             out.add("NEW_PROGRAM", key, n, f'{len(n["assets"])} assets', program_is_ai(n))
         seen.add(key)
@@ -440,6 +490,46 @@ IG_OPEN, IG_SUSPENDED = 3, 4
 IG_REGISTERED = 2  # confidentialityLevel: visible to logged-in researchers only (4 = public)
 
 BONUS_RE = re.compile(r"bonus|promotion|multiplier|double bount|\b2x\b|\bx2\b|limited[- ]time|campaign", re.I)
+YWH_RPS = float(os.environ.get("BBWATCH_YWH_RPS", "4"))
+WARNINGS = []
+
+
+class Pacer:
+    """Spaces requests to one host at least 1/per_sec apart, across threads."""
+
+    def __init__(self, per_sec):
+        self.gap, self.next, self.lock = 1.0 / per_sec, 0.0, threading.Lock()
+
+    def wait(self):
+        with self.lock:
+            now = time.monotonic()
+            at = max(now, self.next)
+            self.next = at + self.gap
+        time.sleep(max(0.0, at - now))
+
+
+def pmap(fn, items, workers):
+    """[(item, result, exception)] for fn over items, on a small thread pool."""
+    def safe(item):
+        try:
+            return item, fn(item), None
+        except Exception as e:
+            return item, None, e
+    with ThreadPoolExecutor(workers) as ex:
+        return list(ex.map(safe, items))
+
+
+def health(state, source, ok, message="", threshold=3, repeat=12):
+    """Warns when a source fails `threshold` runs in a row, then every `repeat` runs, instead
+    of failing silently (stale data looks exactly like 'no changes')."""
+    h = state.setdefault("health", {}).setdefault(source, {"fails": 0})
+    if ok:
+        h["fails"] = 0
+        return
+    h["fails"] += 1
+    n = h["fails"]
+    if n == threshold or (n > threshold and (n - threshold) % repeat == 0):
+        WARNINGS.append(f"{source}: failing for {n} runs in a row. {message}".strip())
 
 
 def get_json(url):
@@ -483,39 +573,112 @@ def list_yeswehack():
         page += 1
 
 
-def ywh_policy(slug):
-    d = get_json(YWH_DETAIL.format(slug))
-    rewards = {}
+YWH_LEVELS = ["very_low", "low", "medium", "high", "critical"]
+
+
+def ywh_programs(state, ywh_list):
+    """Fetches every YesWeHack program's detail each run (56 programs, cheap). Scope comes with
+    each asset's value level, which picks the reward grid that applies to it.
+    Returns ({key: program}, {key: policy}, failures)."""
+    cache = state.setdefault("ywh_scope", {})
+    pacer = Pacer(YWH_RPS)
+
+    def work(key):
+        pacer.wait()
+        return get_json(YWH_DETAIL.format(ywh_list[key]["slug"]))
+
+    policies, fails = {}, 0
+    for key, d, err in pmap(work, list(ywh_list), 3):
+        if err:
+            fails += 1
+            print(f"[!] yeswehack {key}: {err}", file=sys.stderr)
+            continue
+        cache[key] = ywh_scope(d, ywh_list[key]["paid"])
+        policies[key] = ywh_policy(d)
+    programs = {}
+    for key, n in ywh_list.items():
+        if key in cache:
+            programs[key] = {"platform": "yeswehack", "name": n["name"], "url": n["url"],
+                             "paid": n["paid"], "max_bounty": n["max_bounty"], "src": "api", **cache[key]}
+    return programs, policies, fails
+
+
+def _ywh_grids(d):
+    grids = {}
     for k, grid in d.items():
         if k.startswith("reward_grid_") and isinstance(grid, dict):
-            for sev, amount in grid.items():
-                if amount:
-                    rewards[f'{k[len("reward_grid_"):]}.{sev.replace("bounty_", "")}'] = float(amount)
+            grids[k[len("reward_grid_"):]] = {sev.replace("bounty_", ""): float(v) for sev, v in grid.items() if v}
+    return grids
+
+
+def ywh_scope(d, paid):
+    grids = _ywh_grids(d)
+    assets = {}
+    for s in d.get("scopes") or []:
+        ident = (s.get("scope") or "").strip()
+        if not ident:
+            continue
+        level = (s.get("asset_value") or "").lower()
+        # an asset's value level picks its grid; programs without per-level grids use "default"
+        grid = grids.get(level) or grids.get("default") or {}
+        pay = max(grid.values(), default=0.0) if paid else 0.0
+        assets[ident] = _asset(s.get("scope_type"), pay > 0, None, pay, level.upper() or None)
+        if s.get("report_count") is not None:
+            assets[ident]["reports"] = s["report_count"]
+    oos = sorted({x.strip() for x in d.get("out_of_scope") or [] if isinstance(x, str) and x.strip()})
+    return {"assets": assets, "oos": oos}
+
+
+def ywh_policy(d):
     return {
         "rules": d.get("rules") or "",
         "account_access": d.get("account_access") or "",
         "qualifying": sorted(set(d.get("qualifying_vulnerability") or [])),
         "non_qualifying": sorted(set(d.get("non_qualifying_vulnerability") or [])),
-        "rewards": rewards,
+        "rewards": {f"{g}.{sev}": v for g, cells in _ywh_grids(d).items() for sev, v in cells.items()},
     }
 
 
-def added_lines(a, b):
-    """Lines present in b but not a, or None if the texts are identical."""
+def changed_lines(a, b):
+    """(added, removed) lines between two texts, or None if identical."""
     if a == b:
         return None
-    diff_ = difflib.unified_diff(a.splitlines(), b.splitlines(), lineterm="", n=0)
-    return [l[1:].strip(" #*-") for l in diff_
-            if l.startswith("+") and not l.startswith("+++") and l[1:].strip(" #*-")]
+    added, removed = [], []
+    for l in difflib.unified_diff(a.splitlines(), b.splitlines(), lineterm="", n=0):
+        text = l[1:].strip(" #*-")
+        if not text or l.startswith(("+++", "---")):
+            continue
+        if l.startswith("+"):
+            added.append(text)
+        elif l.startswith("-"):
+            removed.append(text)
+    return added, removed
+
+
+def apply_policies(state, policies, lookup, out, links=None):
+    """Stores new policies and diffs them against the previous ones. Fields a source couldn't
+    fetch this run (e.g. one program's exclusions failed) are carried over, not diffed away."""
+    for key, pol in policies.items():
+        prev = state["policy"].get(key)
+        if prev:
+            for f in ("non_qualifying", "qualifying"):
+                if f not in pol and f in prev:
+                    pol[f] = prev[f]
+        state["policy"][key] = pol
+        prog = lookup(key)
+        if prev is not None and prog and wanted(prog):
+            if links and key in links:
+                prog = {**prog, "url": links[key]}
+            diff_policy(key, prog, prev, pol, out)
 
 
 def diff_policy(key, prog, o, n, out):
     """Policy dicts may carry: qualifying / non_qualifying (lists), rewards (cell -> amount),
     rules / account_access (text), testing (setting -> value). Missing fields are skipped."""
-    def add(kind, detail, ai=False, bonus=False):
-        out.add(kind, key, prog, detail[:300], ai, bonus)
+    def add(kind, detail, ai=False, bonus=False, limit=300):
+        out.add(kind, key, prog, detail[:limit], ai, bonus)
 
-    # list fields only compare when both sides have them (H1 exclusions arrive gradually)
+    # list fields only compare when both sides have them
     has = lambda f: f in o and f in n
     old_nq, new_nq = (set(o["non_qualifying"]), set(n["non_qualifying"])) if has("non_qualifying") else (set(), set())
     for x in sorted(old_nq - new_nq):
@@ -533,12 +696,16 @@ def diff_policy(key, prog, o, n, out):
         if a != b:
             add("REWARD_UP" if b > a else "REWARD_DOWN", f"{cell}: {a:g} -> {b:g}")
     for field in ("rules", "account_access"):
-        lines = added_lines(o.get(field, ""), n.get(field, ""))
+        lines = changed_lines(o.get(field, ""), n.get(field, ""))
         if lines is None:
             continue
-        detail = " | ".join(lines[:3]) if lines else "text removed or reworded"
-        add("POLICY_CHANGED", f"{field}: {detail}",
-            any(is_ai(l) for l in lines), any(BONUS_RE.search(l) for l in lines))
+        added, removed = lines
+        # removed lines matter as much as added ones: exclusions are often bullet points
+        parts = [f"+ {l}" for l in added[:3]] + [f"- {l}" for l in removed[:3]]
+        more = len(added) + len(removed) - len(parts)
+        detail = " | ".join(parts) + (f" | (+{more} more lines)" if more > 0 else "")
+        add("POLICY_CHANGED", f"{field}: {detail or 'whitespace/formatting only'}",
+            any(is_ai(l) for l in added + removed), any(BONUS_RE.search(l) for l in added), limit=450)
     o_t, n_t = o.get("testing", {}), n.get("testing", {})
     for k in sorted(set(o_t) | set(n_t)):
         if o_t.get(k) != n_t.get(k):
@@ -556,7 +723,6 @@ IG_ACCESS_NOTES = {"Registered": "login required", "Application": "apply to join
 IG_DENIED_RETRY = timedelta(hours=24)
 # Status flips shorter than this (report caps resetting) aren't pushed as REOPENED.
 REOPEN_MIN = timedelta(hours=float(os.environ.get("BBWATCH_REOPEN_MIN_HOURS", "72")))
-WARNINGS = []
 
 
 def ig_api(path):
@@ -666,23 +832,31 @@ def intigriti_programs(state, ig_list, now):
         c = cache.get(key)
         if c and not c.get("denied"):
             programs[key] = {"platform": "intigriti", "name": n["name"], "url": n["url"],
-                             "paid": n["paid"], "max_bounty": n["max_bounty"],
+                             "paid": n["paid"], "max_bounty": n["max_bounty"], "src": "api",
                              "assets": c["assets"], "oos": c["oos"]}
     return programs, policy_diffs
 
 
 # HackerOne Hacker API (API identifier + token, basic auth). The program list carries the full
-# policy text and the real open/paused status; the feed only lists open programs. Scope stays
-# from the feed (same data). Scope exclusions need one call per program, so they're refreshed
-# round-robin plus immediately for programs whose policy text changed.
+# policy text and the real open/paused status. Every run, each open program's structured scopes
+# and scope exclusions are fetched too, paced under H1's documented 600 reads/minute. Paused
+# programs keep their last known scope.
 
 H1_API = "https://api.hackerone.com/v1/hackers"
 H1_USER, H1_TOKEN = os.environ.get("H1_USERNAME"), os.environ.get("H1_TOKEN")
-H1_EXCL_PER_RUN = int(os.environ.get("BBWATCH_H1_EXCLUSIONS_PER_RUN", "60"))
+# H1 documents 600 reads/min, but answered 429 after ~200 requests at both 7/s and 2/s, while a
+# steady ~1/s ran 250 requests clean. So: 1/s, a time budget per run, stop at the first 429, and
+# fetch programs whose feed scope just changed first, then the least recently refreshed.
+H1_RPS = float(os.environ.get("BBWATCH_H1_RPS", "1"))
+H1_BUDGET = float(os.environ.get("BBWATCH_H1_BUDGET_SECONDS", "300"))
+# Exclusions rarely change on their own: refresh when the policy text changed, else every 6h.
+H1_EXCL_MAX_AGE = timedelta(hours=float(os.environ.get("BBWATCH_H1_EXCL_HOURS", "6")))
 H1_POLICIES = {}  # filled by list_hackerone for this run: key -> policy text
 
 
-def h1_api(url):
+def h1_api(url, pacer=None):
+    if pacer:
+        pacer.wait()
     auth = base64.b64encode(f"{H1_USER}:{H1_TOKEN}".encode()).decode()
     req = urllib.request.Request(url if url.startswith("http") else H1_API + url, headers={
         "Authorization": f"Basic {auth}", "Accept": "application/json", "User-Agent": "bbwatch"})
@@ -712,60 +886,133 @@ def list_hackerone():
     return out
 
 
-def h1_exclusions(handle):
-    cats, url = [], f"/programs/{handle}/scope_exclusions?page%5Bsize%5D=100"
+def _h1_pages(path, pacer):
+    url = path
     while url:
-        j = h1_api(url)
-        cats += [e["attributes"].get("category") or "" for e in j["data"]]
+        j = h1_api(url, pacer)
+        yield from j["data"]
         url = (j.get("links") or {}).get("next")
-    return sorted({c for c in cats if c})
 
 
-def h1_policy_diff(state, new, out):
-    """Diffs H1 policy text for every listed program, and scope exclusions for a rotating
-    slice plus programs whose text just changed."""
+def h1_scope(handle, pacer):
+    assets, oos = {}, []
+    for s in _h1_pages(f"/programs/{handle}/structured_scopes?page%5Bsize%5D=100", pacer):
+        a = s["attributes"]
+        ident = (a.get("asset_identifier") or "").strip()
+        if not ident:
+            continue
+        if a.get("eligible_for_submission", True):
+            assets[ident] = _asset(a.get("asset_type"), bool(a.get("eligible_for_bounty")))
+        else:
+            oos.append(ident)
+    return {"assets": assets, "oos": sorted(set(oos))}
+
+
+def h1_exclusions(handle, pacer):
+    cats = {e["attributes"].get("category") or ""
+            for e in _h1_pages(f"/programs/{handle}/scope_exclusions?page%5Bsize%5D=100", pacer)}
+    return sorted(c for c in cats if c)
+
+
+def h1_programs(state, h1_list, feed):
+    """Returns ({key: program}, {key: policy}, failures, rate-limited flag).
+    H1 answers 429 well below its documented 600/min on these endpoints, so programs are
+    fetched least-recently-refreshed first and the run stops fetching at the first 429; the
+    rest keep their last known scope and exclusions until a later run gets to them."""
+    cache = state.setdefault("h1_scope", {})
+    pacer = Pacer(H1_RPS)
+    stop = threading.Event()
+
+    now = datetime.now(timezone.utc)
     policy = state["policy"]
-    changed_text = set()
-    for key in new:
-        text = H1_POLICIES.get(key, "")
-        prev = policy.get(key)
-        if prev is not None and prev.get("rules") != text:
-            changed_text.add(key)
-    keys = sorted(new)
-    start = state.get("h1_excl_cursor", 0) % max(len(keys), 1)
-    rotation = (keys[start:] + keys[:start])[:H1_EXCL_PER_RUN]
-    state["h1_excl_cursor"] = start + len(rotation)
-    refresh = changed_text | set(rotation)
-    for key in keys:
-        prev = policy.get(key)
-        pol = {"rules": H1_POLICIES.get(key, "")}
-        if prev and "non_qualifying" in prev:
-            pol["non_qualifying"] = prev["non_qualifying"]
-        if key in refresh:
-            try:
-                pol["non_qualifying"] = h1_exclusions(new[key]["handle"])
-            except Exception as e:
-                print(f"[!] hackerone exclusions {new[key]['handle']}: {e}", file=sys.stderr)
-        policy[key] = pol
-        if prev is not None and wanted(new[key]):
-            diff_policy(key, new[key], prev, pol, out)
+
+    def excl_due(key):
+        c, prev = cache.get(key) or {}, policy.get(key) or {}
+        if "excl_fetched" not in c or "non_qualifying" not in prev:
+            return True
+        if prev.get("rules") != H1_POLICIES.get(key, ""):
+            return True  # policy edits usually come with exclusion edits
+        return now - datetime.fromisoformat(c["excl_fetched"]) > H1_EXCL_MAX_AGE
+
+    deadline = time.monotonic() + H1_BUDGET
+
+    def work(key):
+        if stop.is_set():
+            raise Blocked("skipped after a 429")
+        if time.monotonic() > deadline:
+            raise Blocked("time budget used up")
+        handle = h1_list[key]["handle"]
+        try:
+            return h1_scope(handle, pacer), (h1_exclusions(handle, pacer) if excl_due(key) else None)
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                stop.set()
+                raise Blocked("HTTP 429") from e
+            raise
+
+    policies = {k: {"rules": H1_POLICIES.get(k, "")} for k in h1_list}
+    # the feed lags but covers every open program: a change in its copy of a program's scope
+    # is the cheapest hint of what to re-fetch first
+    sigs = state.setdefault("h1_feedsig", {})
+    hinted = set()
+    for k in h1_list:
+        if k in feed:
+            sig = hashlib.sha256(json.dumps([sorted(feed[k]["assets"]), feed[k]["oos"]]).encode()).hexdigest()[:16]
+            if sigs.get(k) not in (None, sig):
+                hinted.add(k)
+            sigs[k] = sig
+    todo = sorted((k for k, n in h1_list.items() if n["open"]),
+                  key=lambda k: (k not in hinted, (cache.get(k) or {}).get("fetched", "")))
+    stamp = now.isoformat(timespec="seconds")
+    fails, done = 0, 0
+    for key, res, err in pmap(work, todo, 3):
+        if err:
+            if not isinstance(err, Blocked):
+                fails += 1
+                print(f"[!] hackerone {key}: {err}", file=sys.stderr)
+            continue
+        scope, excl = res
+        entry = {**scope, "fetched": stamp, "excl_fetched": (cache.get(key) or {}).get("excl_fetched")}
+        if excl is not None:
+            policies[key]["non_qualifying"] = excl
+            entry["excl_fetched"] = stamp
+        if not entry["excl_fetched"]:
+            del entry["excl_fetched"]
+        cache[key] = entry
+        done += 1
+    print(f"[*] hackerone: refreshed {done} of {len(todo)} open programs ({len(hinted)} hinted by the feed)"
+          + (" - stopped at a 429" if stop.is_set() else ""))
+    programs = {}
+    for key, n in h1_list.items():
+        c = cache.get(key)
+        if c and "assets" in c:
+            scope, src = {"assets": c["assets"], "oos": c["oos"]}, "api"
+        elif key in feed:
+            scope, src = {"assets": feed[key]["assets"], "oos": feed[key]["oos"]}, "feed"
+        else:
+            continue
+        programs[key] = {"platform": "hackerone", "name": n["name"], "url": n["url"],
+                         "paid": n["paid"], "max_bounty": None, "src": src, **scope}
+    return programs, policies, fails, stop.is_set()
 
 
-# Bugcrowd public engagement JSON (no account). Each engagement has a versioned changelog; a
-# version holds the brief text, reward ranges per target group, and VRT scope rules (bug-class
-# exclusions). There's no change timestamp in the list, so programs are checked round-robin,
-# plus immediately when the feed shows a change. The full version is only fetched when the
-# latest changelog id moved.
+# Bugcrowd public engagement JSON (no account). The list has bug bounties and VDPs (the feed
+# only has bug bounties). Each engagement has a versioned changelog; a version holds the brief
+# text, the targets per reward group with that group's reward range, and VRT scope rules
+# (bug-class exclusions). Every run checks each engagement's latest changelog id (and
+# announcements for paid ones) and fetches the version only when the id moved.
 
 BC = "https://bugcrowd.com"
-BC_PER_RUN = int(os.environ.get("BBWATCH_BC_PER_RUN", "40"))
+BC_RPS = float(os.environ.get("BBWATCH_BC_RPS", "4"))
 
 
 class Blocked(Exception):
     pass
 
 
-def bc_get(path):
+def bc_get(path, pacer=None):
+    if pacer:
+        pacer.wait()
     req = urllib.request.Request(BC + path, headers={"User-Agent": "bbwatch", "Accept": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
@@ -781,25 +1028,65 @@ def html_text(s):
     return html.unescape(re.sub(r"<[^>]+>", "", s)).strip()
 
 
-def bc_latest_changelog(code):
-    cl = bc_get(f"/engagements/{code}/changelog.json").get("changelogs") or []
+def list_bugcrowd(pacer):
+    out = {}
+    for category in ("bug_bounty",) + (() if BOUNTY_ONLY else ("vdp",)):
+        page = 1
+        while True:
+            j = bc_get(f"/engagements.json?category={category}&page={page}", pacer)
+            for e in j.get("engagements") or []:
+                top = _money(re.sub(r"[^\d.]", "", (e.get("rewardSummary") or {}).get("maxReward") or ""))
+                code = e["briefUrl"].rstrip("/").rsplit("/", 1)[1]
+                out[f'bugcrowd:{BC}{e["briefUrl"]}'] = {"name": e["name"].strip(), "code": code,
+                                                       "url": BC + e["briefUrl"], "paid": top > 0, "max_bounty": top}
+            meta = j.get("paginationMeta") or {}
+            if not j.get("engagements") or page * meta.get("limit", 24) >= meta.get("totalCount", 0):
+                break
+            page += 1
+    return out
+
+
+def bc_latest_changelog(code, pacer):
+    try:
+        cl = bc_get(f"/engagements/{code}/changelog.json", pacer).get("changelogs") or []
+    except urllib.error.HTTPError as e:
+        if e.code == 404:  # listed, but no published brief (some VDPs)
+            return None
+        raise
     latest = [c for c in cl if c.get("changelogState") == "Latest"] or sorted(
         cl, key=lambda c: c.get("publishedAt") or "", reverse=True)
     return latest[0]["id"] if latest else None
 
 
-def bc_version(code, cid):
-    d = bc_get(f"/engagements/{code}/changelog/{cid}.json")["data"]
+def _bc_group_pay(g):
+    best = 0.0
+    for r in (g.get("rewardRangeData") or {}).values():
+        if isinstance(r, dict) and r.get("max"):
+            best = max(best, float(r["max"]))
+        elif isinstance(r, (int, float)) and r:  # e.g. "programMax": 10000
+            best = max(best, float(r))
+    return best
+
+
+def bc_version(code, cid, paid, pacer):
+    """Returns (scope {"assets","oos"}, policy)."""
+    d = bc_get(f"/engagements/{code}/changelog/{cid}.json", pacer)["data"]
     brief = d.get("brief") or {}
-    rewards, excl = {}, []
+    rewards, excl, assets, oos = {}, [], {}, []
     for g in d.get("scope") or []:
+        name = g.get("name") or "group"
+        idents = [((t.get("uri") or t.get("name") or "").strip(), t.get("category")) for t in g.get("targets") or []]
         if not g.get("inScope"):
+            oos += [i for i, _ in idents if i]
             continue
+        pay = _bc_group_pay(g) if paid else 0.0
+        for ident, cat in idents:
+            if ident and (ident not in assets or pay > assets[ident]["pay"]):
+                assets[ident] = _asset(cat, pay > 0, None, pay, name)
         for prio, r in (g.get("rewardRangeData") or {}).items():
-            name = g.get("name") or "group"
             if isinstance(r, dict) and r.get("max"):
                 rewards[f"{name}.P{prio}"] = float(r["max"])
-            elif isinstance(r, (int, float)) and r:  # e.g. "programMax": 10000
+            elif isinstance(r, (int, float)) and r:
                 rewards[f"{name}.{prio}"] = float(r)
     for rule in d.get("vrtScopeRules") or []:
         where = "" if rule.get("allTargets") else " (some targets)"
@@ -807,60 +1094,71 @@ def bc_version(code, cid):
             for v in ids if isinstance(ids, list) else []:
                 excl.append(f'{v.get("id", "").replace("_", " ")}: {rule.get("exclusionType", "")}{where}')
     text = "\n".join(html_text(brief.get(k)) for k in ("description", "targetsOverview", "additionalInformation"))
-    return {"rules": text, "non_qualifying": sorted(set(excl)), "rewards": rewards,
-            "testing": {"safeHarbor": (brief.get("safeHarborStatus") or {}).get("status") or ""}}
+    policy = {"rules": text, "non_qualifying": sorted(set(excl)), "rewards": rewards,
+              "testing": {"safeHarbor": (brief.get("safeHarborStatus") or {}).get("status") or ""}}
+    return {"assets": assets, "oos": sorted(set(oos) - set(assets))}, policy
 
 
-def bc_announcements(code):
+def bc_announcements(code, pacer):
     return [{"id": a["id"], "title": a.get("title") or "", "body": html_text(a.get("body"))}
-            for a in bc_get(f"/engagements/{code}/announcements.json").get("announcements") or []]
+            for a in bc_get(f"/engagements/{code}/announcements.json", pacer).get("announcements") or []]
 
 
-def bugcrowd_diff(state, programs, out):
-    """Checks a rotating slice of Bugcrowd programs (plus ones with feed changes this run) for a
-    new brief version and new announcements."""
-    if not DIRECT:
-        return
+def bc_programs(state, feed):
+    """Returns ({key: program}, {key: policy}, {key: changelog url}, [(key, announcement)],
+    failures, blocked message or None). Programs whose brief can't be read fall back to the
+    last known version, then to the feed."""
+    pacer = Pacer(BC_RPS)
     track = state.setdefault("bc", {})
-    policy = state["policy"]
-    keys = sorted(k for k, p in programs.items() if p["platform"] == "bugcrowd")
-    if not keys:
-        return
-    start = state.get("bc_cursor", 0) % len(keys)
-    rotation = (keys[start:] + keys[:start])[:BC_PER_RUN]
-    state["bc_cursor"] = start + len(rotation)
-    urgent = [k for k in keys if k not in track] + sorted({c["key"] for c in out if c["platform"] == "bugcrowd"})
-    todo = list(dict.fromkeys([k for k in urgent if k in programs][:BC_PER_RUN] + rotation))
-    for key in todo:
-        prog = programs[key]
-        code = prog["url"].rstrip("/").rsplit("/", 1)[1]
-        t = track.get(key, {})
+    try:
+        listing = list_bugcrowd(pacer)
+    except Blocked as e:
+        return None, {}, {}, [], 0, f"Bugcrowd answered {e} on the engagement list"
+    stop = threading.Event()
+
+    def work(key):
+        if stop.is_set():
+            raise Blocked("skipped after an earlier block")
+        e, t = listing[key], track.get(key, {})
         try:
-            cid = bc_latest_changelog(code)
-            anns = bc_announcements(code)
-            pol = policy.get(key)
-            if cid and cid != t.get("changelog"):
-                pol = bc_version(code, cid)
-            time.sleep(0.3)
-        except Blocked as e:
-            WARNINGS.append(f"Bugcrowd answered {e} while checking briefs; skipped the rest this run. "
-                            f"If this repeats, lower BBWATCH_BC_PER_RUN.")
-            return
-        except Exception as e:
-            print(f"[!] bugcrowd {code}: {e}", file=sys.stderr)
+            cid = bc_latest_changelog(e["code"], pacer)
+            anns = bc_announcements(e["code"], pacer) if e["paid"] else None
+            fresh = cid and (cid != t.get("changelog") or "scope" not in t)
+            version = bc_version(e["code"], cid, e["paid"], pacer) if fresh else None
+        except Blocked:
+            stop.set()
+            raise
+        return cid, anns, version
+
+    policies, links, announcements, fails, blocked = {}, {}, [], 0, None
+    for key, res, err in pmap(work, list(listing), 3):
+        if err:
+            if isinstance(err, Blocked):
+                blocked = blocked or f"Bugcrowd answered {err}"
+            else:
+                fails += 1
+                print(f"[!] bugcrowd {key}: {err}", file=sys.stderr)
             continue
-        first = key not in track
-        if not first and wanted(prog):
-            if key in policy and pol is not policy[key]:
-                diff_policy(key, prog, policy[key], pol, out)
-            known = set(t.get("ann", []))
-            for a in anns:
-                if a["id"] not in known:
-                    text = f'{a["title"]}: {a["body"]}'
-                    out.add("ANNOUNCEMENT", key, prog, text[:300], is_ai(text), bool(BONUS_RE.search(text)))
-        if pol is not None:
-            policy[key] = pol
-        track[key] = {"changelog": cid, "ann": sorted(a["id"] for a in anns)}
+        cid, anns, version = res
+        t = track.setdefault(key, {})
+        known = t.get("ann")
+        if anns is not None:
+            if known is not None:
+                announcements += [(key, a) for a in anns if a["id"] not in set(known)]
+            t["ann"] = sorted(a["id"] for a in anns)
+        if version:
+            t["scope"], policies[key] = version
+            t["changelog"] = cid
+            links[key] = f'{BC}/engagements/{listing[key]["code"]}/changelog/{cid}'
+    programs = {}
+    for key, e in listing.items():
+        scope, src = track.get(key, {}).get("scope"), "api"
+        if scope is None and key in feed:
+            scope, src = {"assets": feed[key]["assets"], "oos": feed[key]["oos"]}, "feed"
+        if scope is not None:
+            programs[key] = {"platform": "bugcrowd", "name": e["name"], "url": e["url"],
+                             "paid": e["paid"], "max_bounty": e["max_bounty"], "src": src, **scope}
+    return programs, policies, links, announcements, fails, blocked
 
 
 def list_note(n):
@@ -879,22 +1177,25 @@ def fetch_lists(state):
     if IG_TOKEN:
         def ig_fn():
             try:
-                return list_intigriti_api()
+                res = list_intigriti_api()
+                health(state, "Intigriti token", True)
+                return res
             except Exception as e:
-                WARNINGS.append(f"Intigriti token failed ({e}). Using the public list until it's "
-                                f"fixed. Expired? Create a new token and update the INTIGRITI_TOKEN secret.")
+                health(state, "Intigriti token", False, f"({e}) Using the public list meanwhile. Expired? "
+                       f"Create a new token and update the INTIGRITI_TOKEN secret.", threshold=1)
                 return list_intigriti()
     sources = [("intigriti", ig_fn), ("yeswehack", list_yeswehack)]
     if H1_USER and H1_TOKEN:
         sources.append(("hackerone", list_hackerone))
     for plat, fn in sources:
+        hint = {"hackerone": "Check the H1_USERNAME / H1_TOKEN secrets."}.get(plat, "")
         try:
             new = fn()
+            health(state, f"{plat} program list", True)
         except Exception as e:
             print(f"[!] {plat} list: {e}", file=sys.stderr)
-            if plat == "hackerone":
-                WARNINGS.append(f"HackerOne API failed ({e}). Policy and pause tracking for H1 is off "
-                                f"until it's fixed. Check the H1_USERNAME / H1_TOKEN secrets.")
+            health(state, f"{plat} program list", False, f"({e}) {hint}",
+                   threshold=1 if plat == "hackerone" else 3)
             continue
         before = sum(1 for v in state["lists"].values() if v["platform"] == plat)
         if before >= 20 and len(new) < before * (1 - GLITCH_DROP):
@@ -905,9 +1206,8 @@ def fetch_lists(state):
 
 
 def direct_diff(state, lists, out, now):
-    """Diffs the direct lists (and YesWeHack policies) into out. Mutates state."""
+    """Diffs the direct program lists (status, new programs) into out. Mutates state."""
     seen = state["seen"]
-    policy = state["policy"]
     feed = state["programs"]
     edited = []
     for plat, new in lists.items():
@@ -952,24 +1252,6 @@ def direct_diff(state, lists, out, now):
         for key in old:
             del state["lists"][key]
         state["lists"].update(new)
-
-        if plat == "hackerone":
-            h1_policy_diff(state, new, out)
-        if plat == "yeswehack":
-            for key, n in new.items():
-                o = old.get(key)
-                if key in policy and o and o["updated"] == n["updated"]:
-                    continue
-                try:
-                    pol = ywh_policy(n["slug"])
-                except Exception as e:
-                    print(f"[!] yeswehack policy {n['slug']}: {e}", file=sys.stderr)
-                    continue
-                time.sleep(0.3)
-                prev = policy.get(key)
-                policy[key] = pol
-                if prev and wanted(n):
-                    diff_policy(key, n, prev, pol, out)
 
     # Intigriti edits we can't see inside: only worth a push if nothing else explains them
     explained = {c["key"] for c in out}
@@ -1133,39 +1415,81 @@ def main():
     if "--test-alert" in sys.argv:
         return test_alert()
     now = datetime.now(timezone.utc)
-    new, fetched = snapshot()
+    feed, fetched, feed_digest = snapshot()
+    new = dict(feed)
     baseline = not STATE.exists()
     state = ({"version": STATE_VERSION, "programs": {}, "gone": {}, "lists": {}, "policy": {},
               "seen": set()} if baseline else load())
+    check_feed(state, fetched, feed_digest, now)
     lists = fetch_lists(state)
 
-    # Intigriti from the researcher API (when the token works) instead of the feed. Switching
-    # source either way re-baselines Intigriti silently: the two sources list different programs.
-    ig_policy_diffs = []
-    ig_source = "feed"
-    if IG_TOKEN and "intigriti" in lists and any("id" in v for v in lists["intigriti"].values()):
-        ig_programs, ig_policy_diffs = intigriti_programs(state, lists["intigriti"], now)
-        if ig_programs:
-            ig_source = "api"
-            new = {k: v for k, v in new.items() if v["platform"] != "intigriti"}
-            new.update(ig_programs)
-            fetched.add("intigriti")
-    if state.get("ig_source", "feed") != ig_source and not baseline:
-        print(f"[*] intigriti source {state.get('ig_source', 'feed')} -> {ig_source}: re-baselining")
-        state["programs"] = {k: v for k, v in state["programs"].items() if v["platform"] != "intigriti"}
-        state["programs"].update({k: v for k, v in new.items() if v["platform"] == "intigriti"})
-        state["gone"] = {k: v for k, v in state["gone"].items() if not k.startswith("intigriti:")}
-        state["lists"] = {k: v for k, v in state["lists"].items() if v["platform"] != "intigriti"}
-        state["seen"] |= {k for k, v in new.items() if v["platform"] == "intigriti"}
-        ig_policy_diffs = []
-    state["ig_source"] = ig_source
+    # Direct platform sources, run in parallel (each paced for its own host). Each returns the
+    # platform's programs; where it works it replaces the feed for that platform.
+    jobs = {}
+    if DIRECT:
+        if IG_TOKEN and "intigriti" in lists and any("id" in v for v in lists["intigriti"].values()):
+            jobs["intigriti"] = lambda: intigriti_programs(state, lists["intigriti"], now)
+        if "hackerone" in lists:
+            jobs["hackerone"] = lambda: h1_programs(state, lists["hackerone"], feed)
+        if "yeswehack" in lists:
+            jobs["yeswehack"] = lambda: ywh_programs(state, lists["yeswehack"])
+        jobs["bugcrowd"] = lambda: bc_programs(state, feed)
+    results = {plat: (res, err) for plat, res, err in pmap(lambda p: jobs[p](), list(jobs), len(jobs) or 1)}
+
+    direct, policies, links, ig_policy_diffs, announcements = {}, {}, {}, [], []
+    for plat, (res, err) in results.items():
+        if err:
+            print(f"[!] {plat} direct: {err}", file=sys.stderr)
+            health(state, f"{plat} direct source", False, f"({err}) Falling back to the feed.")
+            continue
+        if plat == "intigriti":
+            programs, ig_policy_diffs = res
+            fails = 0
+        elif plat == "bugcrowd":
+            programs, pol, lnk, announcements, fails, blocked = res
+            policies.update(pol)
+            links.update(lnk)
+            health(state, "Bugcrowd", not blocked, f"{blocked}. Checks stopped for that run; "
+                   f"if this repeats, lower the BBWATCH_BC_RPS variable.", threshold=2)
+        elif plat == "hackerone":
+            programs, pol, fails, limited = res
+            policies.update(pol)
+        else:
+            programs, pol, fails = res
+            policies.update(pol)
+        checked = max(len(programs), 1)
+        health(state, f"{plat} scope/policy fetches", fails <= checked * 0.2,
+               f"{fails} of {checked} programs failed this run.")
+        if programs:
+            direct[plat] = programs
+
+    # Each platform's programs come from its direct source when that worked, else the feed.
+    # Switching source either way re-baselines that platform silently (different coverage).
+    sources = state.setdefault("sources", {"intigriti": state.pop("ig_source", "feed")})
+    for plat in PLATFORMS:
+        src = "api" if plat in direct else "feed"
+        if plat in direct:
+            new = {k: v for k, v in new.items() if v["platform"] != plat}
+            new.update(direct[plat])
+            fetched.add(plat)
+        if sources.get(plat, "feed") != src and not baseline:
+            print(f"[*] {plat} source {sources.get(plat, 'feed')} -> {src}: re-baselining")
+            state["programs"] = {k: v for k, v in state["programs"].items() if v["platform"] != plat}
+            state["programs"].update({k: v for k, v in new.items() if v["platform"] == plat})
+            state["gone"] = {k: v for k, v in state["gone"].items() if not k.startswith(plat + ":")}
+            state["seen"] |= {k for k, v in new.items() if v["platform"] == plat}
+            if plat == "intigriti":
+                state["lists"] = {k: v for k, v in state["lists"].items() if v["platform"] != plat}
+                ig_policy_diffs = []
+        sources[plat] = src
 
     if not new:
         sys.exit("[!] no data fetched")
     if baseline:
         state["programs"] = new
         state["seen"] = set(new)
-        direct_diff(state, lists, Changes(), now)  # baseline lists + policies silently
+        direct_diff(state, lists, Changes(), now)               # baseline lists silently
+        apply_policies(state, policies, lambda k: None, Changes())  # and policies
         save(state)
         print(f"[+] baseline saved: {len(new)} programs, {len(state['lists'])} listed, "
               f"{len(state['policy'])} policies. Next run reports changes.")
@@ -1184,17 +1508,30 @@ def main():
         if plat not in fetched:
             new.update({k: v for k, v in old.items() if v["platform"] == plat})
 
+    # A program whose scope came from a different source than last run (e.g. feed fallback
+    # one run, API the next) is adopted silently: the sources format identifiers differently.
+    for key, n in new.items():
+        if key in old and old[key].get("src") != n.get("src"):
+            old[key] = n
+
     changes = diff(state, new, fetched, now, authoritative=frozenset(lists))
     state["programs"] = new
     direct_diff(state, lists, changes, now)
+    lookup = lambda k: new.get(k) or state["lists"].get(k)
     for key, before, after in ig_policy_diffs:
-        prog = new.get(key) or state["lists"].get(key)
+        prog = lookup(key)
         if prog and wanted(prog):
             diff_policy(key, prog, before, after, changes)
-    bugcrowd_diff(state, new, changes)
+    apply_policies(state, policies, lookup, changes, links)
+    for key, a in announcements:
+        prog = new.get(key)
+        if prog and wanted(prog):
+            text = f'{a["title"]}: {a["body"]}'
+            changes.add("ANNOUNCEMENT", key, {**prog, "url": prog["url"] + "/announcements"},
+                        text[:300], is_ai(text), bool(BONUS_RE.search(text)))
     for w in WARNINGS:
         changes.add("WARNING", "bbwatch", {"platform": "bbwatch", "name": "bbwatch needs attention",
-                                           "url": "https://github.com/sinansinansi/bbwatch/settings/secrets/actions",
+                                           "url": "https://github.com/sinansinansi/bbwatch/actions",
                                            "paid": True, "max_bounty": None}, w)
     sort_changes(changes)
     save(state)
@@ -1206,7 +1543,6 @@ def main():
     for c in changes:
         print(fmt(c))
     print(f"[+] {len(changes)} changes -> {path}")
-
 
 if __name__ == "__main__":
     main()
