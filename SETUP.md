@@ -1,90 +1,75 @@
-# bbwatch setup, from zero accounts
+# bbwatch setup
 
-Total time: about 20 minutes. You need **one account (GitHub)** and **one phone app (ntfy)**.
-The bug bounty platform accounts are separate (step 5), and the monitor does not need them.
+This repo is **public**, so nothing secret or account-restricted lives in it:
+- Tokens, the ntfy topic and webhooks are **repository secrets**.
+- Program state and reports live in the **Actions cache**, which only this repo's workflows can read.
+  Some of that data (e.g. Intigriti programs visible only to logged-in researchers) must not be published.
+- Never commit `state.json`, `data/` or `reports/`. `.gitignore` already excludes them.
 
-Your ntfy topic (keep it private, since anyone who knows it can read and send to it):
-
-```
-bbwatch-7cd86d7d6af4d0ca540d667c
-```
-
----
-
-## 1. Phone: install ntfy (no account)
+## 1. Phone: ntfy (no account)
 
 1. Install **ntfy** from the Play Store / App Store (publisher: Philipp Heckel).
-2. Tap **+** → *Subscribe to topic* → paste the topic above → leave server as `ntfy.sh` → Subscribe.
-3. Android: open the topic's settings and allow notifications. iOS: allow notifications when prompted.
+2. Make a random topic name. Anyone who knows it can read and send to it, so keep it out of the repo:
 
-Test it now from PowerShell on your PC:
+   ```powershell
+   "bbwatch-" + -join ((1..24) | ForEach-Object { '{0:x}' -f (Get-Random -Max 16) })
+   ```
 
-```powershell
-Invoke-RestMethod -Method Post -Uri https://ntfy.sh/bbwatch-7cd86d7d6af4d0ca540d667c -Body "hello from my PC"
-```
+3. In the app: **+** → paste the topic → server `ntfy.sh` → Subscribe. Allow notifications
+   (Android: also set battery usage for ntfy to *Unrestricted*).
 
-Your phone should buzz within a few seconds.
+## 2. Secrets
 
-## 2. GitHub account
+Repo → **Settings → Secrets and variables → Actions → New repository secret**:
 
-1. Sign up at https://github.com/signup and verify your email.
-2. Turn on 2FA (Settings → Password and authentication). You'll want this anyway, and so will the bounty platforms.
-3. Settings → Emails → tick **Keep my email addresses private**. Copy the `...@users.noreply.github.com`
-   address shown there. You'll use it in step 3.
-
-## 3. Create the repo and push the code
-
-1. On GitHub: **+** (top right) → *New repository* → name `bbwatch` → **Private** → do NOT add a README → Create.
-2. In PowerShell, run this once to tell git who you are (use your GitHub username and the noreply email):
-
-```powershell
-git config --global user.name "YOUR_GITHUB_USERNAME"
-git config --global user.email "YOUR_ID+YOUR_USERNAME@users.noreply.github.com"
-```
-
-3. Push the code (replace `YOUR_GITHUB_USERNAME`):
-
-```powershell
-cd $HOME\bugbountybd\bbwatch
-git init -b main
-git add .
-git commit -m "bbwatch initial"
-git remote add origin https://github.com/YOUR_GITHUB_USERNAME/bbwatch.git
-git push -u origin main
-```
-
-A browser window opens asking you to sign in to GitHub. That's Git Credential Manager, and you only do it once.
-
-## 4. Connect the repo to your phone
-
-1. Repo → **Settings** → *Secrets and variables* → **Actions** → *New repository secret*:
-   - Name `NTFY_TOPIC`, value `bbwatch-7cd86d7d6af4d0ca540d667c`
-2. Optional, on the **Variables** tab of the same page:
-   - `BBWATCH_BOUNTY_ONLY` = `1` to skip VDPs (no-pay programs). Recommended once you have a few
-     VDP points for reputation.
-   - `BBWATCH_MIN_BOUNTY` = e.g. `500` to skip low-max programs (not applied to HackerOne, whose feed has no amounts).
-3. Repo → **Actions** tab → enable workflows if asked → **bbwatch** → *Run workflow*:
-   - First with **Only send a test notification** ticked. Your phone should get a "Test alert".
-   - Then once with it unticked. This saves the baseline. From then on it runs every hour on its
-     own and pushes only what changed.
-
-Notes:
-- Tapping a notification opens that program's page.
-- `[AI]` in the title marks GenAI-looking assets. They get higher priority, so they ring louder.
-- At most 15 pushes per run, then one "+N more" summary. The full list is in `reports/` in the repo.
-- GitHub may delay scheduled runs by 5–20 min at busy times. That's normal.
-- To stop it: Actions → bbwatch → ⋯ → *Disable workflow*.
-
-## 5. Bug bounty platform accounts (for hunting, not for the monitor)
-
-Sign up on each and turn on 2FA:
-
-| Platform | Signup | Notes |
+| Secret | Value | Needed for |
 |---|---|---|
-| HackerOne | https://hackerone.com/users/sign_up | Do the Hacker101 CTF for your first private invites. Also set up an API token later (Settings → API Token) for private-program monitoring. |
-| Bugcrowd | https://bugcrowd.com/user/sign_up | Complete profile + "Bugcrowd University" to start getting invites. |
-| Intigriti | https://login.intigriti.com/account/register | Requires ID verification before payouts. Personal access token available in settings. |
-| YesWeHack | https://yeswehack.com/auth/register | KYC needed for payouts. |
+| `NTFY_TOPIC` | your topic from step 1 | phone pushes |
+| `INTIGRITI_TOKEN` | Intigriti → Settings → Personal access tokens | Intigriti scope/policy for every program you can see |
+| `H1_USERNAME`, `H1_TOKEN` | HackerOne → Settings → API Token (identifier + token) | HackerOne policy, exclusions, paused programs |
 
-Set up payout methods (PayPal/bank) and tax forms on each **before** your first valid report, since some
-platforms hold payouts until that's done. Use a single password manager and unique passwords throughout.
+YesWeHack and Bugcrowd need nothing.
+
+Optional **Variables** (same page, Variables tab): `BBWATCH_BOUNTY_ONLY=1` skips VDPs, and
+`BBWATCH_MIN_BOUNTY=500` skips low-max programs (except HackerOne, whose data has no amounts).
+
+## 3. Reliable 30-minute schedule
+
+GitHub's own `schedule:` is best-effort (runs are often late or skipped, especially on new repos). It stays in
+the workflow as a backup. The reliable trigger is an external cron that starts the workflow through GitHub's API.
+
+**a. A token that can only start this workflow.** GitHub → your avatar → **Settings → Developer settings →
+Personal access tokens → Fine-grained tokens → Generate new token**:
+- Name `bbwatch-trigger`, expiration up to 1 year (put a reminder in your calendar)
+- Repository access: **Only select repositories** → `bbwatch`
+- Permissions → Repository → **Actions: Read and write** (everything else stays "No access")
+
+**b. cron-job.org** (free): create an account → **Create cronjob**:
+- URL: `https://api.github.com/repos/<your-username>/bbwatch/actions/workflows/bbwatch.yml/dispatches`
+- Schedule: every 30 minutes, at minutes **10 and 40** (just after the scope feed refreshes)
+- **Advanced** tab:
+  - Request method: **POST**
+  - Headers:
+    - `Authorization`: `Bearer <the token from step a>`
+    - `Accept`: `application/vnd.github+json`
+    - `X-GitHub-Api-Version`: `2022-11-28`
+    - `Content-Type`: `application/json`
+  - Request body: `{"ref":"main"}`
+- Notifications: turn on **notify on failure**, so you hear about it when the token expires.
+- Save, then **Test run**. A `204 No Content` response means it worked, and a new run appears in the Actions tab.
+
+## 4. First runs
+
+Actions → **bbwatch** → *Run workflow*:
+1. With **Only send a test notification** ticked → your phone gets "Test alert".
+2. Unticked → saves the baseline silently. After that every run pushes only what changed.
+
+## Notes
+
+- Tapping a notification opens that program's page.
+- `[AI]` marks GenAI-looking assets/text and `[BONUS]` marks bonus or promotion text. Both ring loudly.
+- Max 15 pushes per run. Beyond that you get one push with the full report attached (ntfy.sh keeps
+  attachments for about 3 hours).
+- `WARNING` pushes mean bbwatch itself needs attention, e.g. an expired token.
+- To stop it: disable the cron-job.org job and Actions → bbwatch → ⋯ → *Disable workflow*.
+- Losing the cache (e.g. after 7 days without runs) just means the next run re-baselines silently.

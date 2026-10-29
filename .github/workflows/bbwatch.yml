@@ -2,9 +2,9 @@ name: bbwatch
 
 on:
   schedule:
-    # Hourly keeps a private repo at ~720 of the 2000 free Actions minutes/month.
-    # For every 30 min use "15,45 * * * *" (~1440 min/month).
-    - cron: "20 * * * *"
+    # Backup only: GitHub's scheduler is best-effort (late or skipped runs are common).
+    # The reliable trigger is an external cron calling workflow_dispatch, see SETUP.md.
+    - cron: "10,40 * * * *"
   workflow_dispatch:
     inputs:
       test_alert:
@@ -12,15 +12,21 @@ on:
         type: boolean
         default: false
 
+# State and reports never go into git: the repo is public and some program data (Intigriti
+# login-only programs) must not be published. They live in the Actions cache instead, which
+# only this repo's workflows can read.
 permissions:
-  contents: write
+  contents: read
+  actions: write   # to delete old state caches
 
-concurrency: bbwatch
+concurrency:
+  group: bbwatch
+  cancel-in-progress: false
 
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     env:
       NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
       INTIGRITI_TOKEN: ${{ secrets.INTIGRITI_TOKEN }}
@@ -31,6 +37,8 @@ jobs:
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       BBWATCH_MIN_BOUNTY: ${{ vars.BBWATCH_MIN_BOUNTY || '0' }}
       BBWATCH_BOUNTY_ONLY: ${{ vars.BBWATCH_BOUNTY_ONLY || '0' }}
+      BBWATCH_STATE: ${{ github.workspace }}/data/state.json
+      BBWATCH_REPORT_DIR: ${{ github.workspace }}/data/reports
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -39,14 +47,27 @@ jobs:
       - name: Test alert
         if: inputs.test_alert
         run: python bbwatch.py --test-alert
+      - name: Restore state
+        if: ${{ !inputs.test_alert }}
+        uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: bbwatch-state-${{ github.run_id }}
+          restore-keys: bbwatch-state-
       - name: Diff programs
         if: ${{ !inputs.test_alert }}
         run: python bbwatch.py
-      - name: Commit snapshot
-        if: ${{ !inputs.test_alert }}
+      - name: Save state
+        if: ${{ !inputs.test_alert && success() }}
+        uses: actions/cache/save@v4
+        with:
+          path: data
+          key: bbwatch-state-${{ github.run_id }}
+      - name: Delete older state caches
+        if: ${{ !inputs.test_alert && success() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          git config user.name bbwatch
-          git config user.email bbwatch@users.noreply.github.com
-          git add -A   # reports/ doesn't exist until the first change is found
-          git diff --cached --quiet || git commit -m "bbwatch $(date -u +%F_%H%M)"
-          git push
+          gh cache list --repo "$GITHUB_REPOSITORY" --key bbwatch-state- --sort created_at --order desc \
+            --limit 100 --json key --jq '.[3:][].key' |
+          while read -r key; do gh cache delete "$key" --repo "$GITHUB_REPOSITORY"; done

@@ -300,6 +300,7 @@ def load():
 def save(state):
     # sorted + one item per line so git stores small diffs between runs
     out = {**state, "seen": sorted(state["seen"])}
+    STATE.parent.mkdir(parents=True, exist_ok=True)  # first run on a fresh cache
     STATE.write_text(json.dumps(out, sort_keys=True, indent=0), encoding="utf-8")
 
 
@@ -998,14 +999,21 @@ def fmt(c):
     return f'{tag}{c["kind"]} [{c["platform"]}] {name}{detail}\n    {c["url"]}'
 
 
+REPORT_KEEP = timedelta(days=14)
+
+
 def write_report(changes, now):
+    """Appends this run to the day's report. Returns (path, this run's section as text)."""
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    for old in REPORT_DIR.glob("*.md"):
+        if now - datetime.fromtimestamp(old.stat().st_mtime, timezone.utc) > REPORT_KEEP:
+            old.unlink()
+    section = f"\n## {now:%Y-%m-%d %H:%M} UTC - {len(changes)} changes\n\n" + "".join(
+        "- " + fmt(c).replace("\n    ", "  \n  ") + "\n" for c in changes)
     path = REPORT_DIR / f"{now:%Y-%m-%d}.md"
     with open(path, "a", encoding="utf-8") as f:
-        f.write(f"\n## {now:%H:%M} UTC - {len(changes)} changes\n\n")
-        for c in changes:
-            f.write("- " + fmt(c).replace("\n    ", "  \n  ") + "\n")
-    return path
+        f.write(section)
+    return path, section
 
 
 def post_json(url, payload):
@@ -1029,9 +1037,9 @@ def _label(kind):
     return kind.replace("_", " ").title().replace("Oos", "OOS").replace("Vdp", "VDP")
 
 
-def ntfy(changes):
+def ntfy(changes, report=None):
     """One push per program for positive changes (tap opens the program), one silent digest
-    for negative ones."""
+    for negative ones. When something doesn't fit, this run's full report is attached."""
     topic = os.environ.get("NTFY_TOPIC")
     if not topic:
         return
@@ -1042,6 +1050,18 @@ def ntfy(changes):
             post_json(server, {"topic": topic, **payload})
         except Exception as e:
             print(f"[!] ntfy failed: {e}", file=sys.stderr)
+
+    def send_report(title):
+        if not report:
+            return send({"title": title, "priority": 2})
+        try:  # ntfy attachment: PUT the file body; headers must be ASCII
+            req = urllib.request.Request(f"{server}/{topic}", data=report.encode("utf-8"), method="PUT", headers={
+                "Filename": f"bbwatch-{datetime.now(timezone.utc):%Y%m%d-%H%M}.md", "Title": title,
+                "Message": "Full report for this run attached (ntfy.sh keeps attachments ~3 hours).",
+                "Priority": "2", "User-Agent": "bbwatch"})
+            urllib.request.urlopen(req, timeout=30).read()
+        except Exception as e:
+            print(f"[!] ntfy attachment failed: {e}", file=sys.stderr)
 
     groups = {}
     for c in changes:
@@ -1065,10 +1085,6 @@ def ntfy(changes):
             "tags": ["robot"] if ai else ["moneybag"] if bonus else ["mag"],
             "priority": max(prio, 4) if hot else prio,
         })
-    if len(items) > NTFY_MAX:
-        send({"title": f"+{len(items) - NTFY_MAX} more programs changed",
-              "message": "See the reports/ folder in your GitHub repo.", "priority": 2})
-
     neg = [c for c in changes if c["kind"] in NEGATIVE]
     if neg:
         lines = [f'{_label(c["kind"])}: {c["name"]} [{c["platform"]}] {c["detail"]}'.strip() for c in neg]
@@ -1076,9 +1092,12 @@ def ntfy(changes):
         send({"title": f"{len(neg)} negative changes", "message": body[:3900],
               "tags": ["small_red_triangle_down"], "priority": 1})
 
+    if len(items) > NTFY_MAX or len(neg) > 25:
+        send_report(f"+{max(len(items) - NTFY_MAX, 0)} more programs changed - full report attached")
 
-def alert(changes):
-    ntfy(changes)
+
+def alert(changes, report=None):
+    ntfy(changes, report)
     pos = [fmt(c) for c in changes if c["kind"] not in NEGATIVE | QUIET]
     neg = [fmt(c) for c in changes if c["kind"] in NEGATIVE]
     lines = pos + (["--- negative ---"] + neg if neg else [])
@@ -1182,8 +1201,8 @@ def main():
     if not changes:
         print("[=] no changes")
         return
-    path = write_report(changes, now)
-    alert(changes)
+    path, section = write_report(changes, now)
+    alert(changes, section)
     for c in changes:
         print(fmt(c))
     print(f"[+] {len(changes)} changes -> {path}")

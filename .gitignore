@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
 .env
+# runtime data lives in the Actions cache, never in git (public repo)
+data/
+state.json
+reports/

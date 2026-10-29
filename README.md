@@ -70,7 +70,7 @@ See **[SETUP.md](SETUP.md)**. It covers everything from zero accounts to phone p
 Alert channels (set any as repo secrets): `NTFY_TOPIC` (phone push, recommended), `DISCORD_WEBHOOK`,
 `TELEGRAM_TOKEN` + `TELEGRAM_CHAT_ID`.
 
-Snapshots (`state.json`) and daily reports (`reports/YYYY-MM-DD.md`) are committed back to the repo, so the git history doubles as a log.
+State and daily reports are kept in the Actions cache, never in git: the repo is public and some program data is login-only. When a run has more changes than fit in pushes, the full report is attached to a push.
 
 ## Local run
 
