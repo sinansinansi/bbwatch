@@ -22,10 +22,11 @@ Watches HackerOne, Bugcrowd, Intigriti and YesWeHack **public** programs for cha
 
 | Kind | Platforms | Why |
 |---|---|---|
-| `EXCLUSION_REMOVED` | YesWeHack, HackerOne | A non-qualifying bug class now pays. You can find it everywhere on that program. |
+| `EXCLUSION_REMOVED` | YesWeHack, HackerOne, Bugcrowd (VRT rules) | A non-qualifying bug class now pays. You can find it everywhere on that program. |
 | `QUALIFYING_ADDED` | YesWeHack | New accepted vulnerability class. |
-| `REWARD_UP` | YesWeHack | A reward grid cell went up, e.g. `default.critical: 5000 -> 7500`. |
-| `POLICY_CHANGED` | YesWeHack, HackerOne | Rules or account-access text changed. The push shows the added lines. |
+| `REWARD_UP` | YesWeHack, Bugcrowd | A reward cell went up, e.g. `default.critical: 5000 -> 7500` or `Primary Target Group.P1: 4500 -> 8000`. |
+| `POLICY_CHANGED` | YesWeHack, HackerOne, Bugcrowd | Rules / brief text changed. The push shows the added lines. |
+| `ANNOUNCEMENT` | Bugcrowd | New program announcement (went public, reward changes, promotions). |
 | `POLICY_CHANGED` | Intigriti (token) | Rules of engagement text, or testing requirements (rate limit, user agent, safe harbour). |
 | `PROGRAM_UPDATED` | Intigriti (no token) | The program was edited. The public list doesn't say what, so open it and look. |
 
@@ -44,6 +45,7 @@ Watches HackerOne, Bugcrowd, Intigriti and YesWeHack **public** programs for cha
 | Intigriti public program list (fallback without token) | status, `lastUpdatedAt`, ~50 public programs the feed skips |
 | YesWeHack public API | status, full policy (rules, (non-)qualifying vulns, reward grids), fetched only when `last_update_at` changes |
 | HackerOne Hacker API (`H1_USERNAME` + `H1_TOKEN` secrets) | all ~600 public programs including ~145 paused ones the feed drops, real open/paused status, full policy text every run, scope exclusions (60 programs per run in rotation, plus any program whose policy just changed) |
+| Bugcrowd public engagement JSON | latest brief version (text, reward ranges per target group, VRT scope rules, safe harbor) and announcements. 40 programs per run in rotation (~every 8h each), plus any program the feed shows changing. Stops and warns on 403/429. |
 
 Intigriti programs that flip suspended → open after less than 3 days (report caps resetting; some do it daily)
 are logged as `REOPENED_BRIEF` in the report only. After a longer suspension they push `REOPENED`.
@@ -53,7 +55,8 @@ The feed only lists open programs, so a paused program just disappears. On Hacke
 remembers it, reports `PAUSED_OR_REMOVED` after 3 hours missing (to ignore feed glitches), and `REOPENED` if it
 comes back. On Intigriti and YesWeHack the platform list reports status directly.
 
-Not covered yet: Bugcrowd policy text, HackerOne bounty tables (not in the API).
+Not covered: HackerOne bounty tables (not in the API), Bugcrowd pause status (paused engagements just leave the
+list, so the feed-disappearance rule applies).
 
 Items tagged `[AI]` are HackerOne `AI_MODEL` assets or names/hosts matching llm/chat/agent/mcp/copilot/etc.
 They always push at high priority.

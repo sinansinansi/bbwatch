@@ -60,6 +60,7 @@ Stdlib only. Config through env vars:
 """
 import base64
 import difflib
+import html
 import json
 import os
 import re
@@ -114,6 +115,7 @@ KINDS = {
     "REWARD_UP": (6, 3),
     "POLICY_CHANGED": (6, 3),
     "PROGRAM_UPDATED": (7, 3),
+    "ANNOUNCEMENT": (4, 4),
     "PAUSED": (9, 1),
     "EXCLUSION_ADDED": (9, 1),
     "QUALIFYING_REMOVED": (9, 1),
@@ -322,7 +324,7 @@ class Changes(list):
     def add(self, kind, key, prog, detail="", ai=False, bonus=False):
         self.append({"kind": kind, "key": key, "platform": prog["platform"], "name": prog["name"],
                      "url": prog["url"], "paid": prog["paid"], "max_bounty": prog["max_bounty"],
-                     "detail": detail, "ai": ai, "bonus": bonus})
+                     "detail": " ".join(str(detail).split()), "ai": ai, "bonus": bonus})
 
 
 def diff_program(key, o, n, out):
@@ -748,6 +750,118 @@ def h1_policy_diff(state, new, out):
             diff_policy(key, new[key], prev, pol, out)
 
 
+# Bugcrowd public engagement JSON (no account). Each engagement has a versioned changelog; a
+# version holds the brief text, reward ranges per target group, and VRT scope rules (bug-class
+# exclusions). There's no change timestamp in the list, so programs are checked round-robin,
+# plus immediately when the feed shows a change. The full version is only fetched when the
+# latest changelog id moved.
+
+BC = "https://bugcrowd.com"
+BC_PER_RUN = int(os.environ.get("BBWATCH_BC_PER_RUN", "40"))
+
+
+class Blocked(Exception):
+    pass
+
+
+def bc_get(path):
+    req = urllib.request.Request(BC + path, headers={"User-Agent": "bbwatch", "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code in (403, 429):
+            raise Blocked(f"HTTP {e.code}") from e
+        raise
+
+
+def html_text(s):
+    s = re.sub(r"<\s*(br|/p|/li|/h\d|/div|/tr)[^>]*>", "\n", s or "", flags=re.I)
+    return html.unescape(re.sub(r"<[^>]+>", "", s)).strip()
+
+
+def bc_latest_changelog(code):
+    cl = bc_get(f"/engagements/{code}/changelog.json").get("changelogs") or []
+    latest = [c for c in cl if c.get("changelogState") == "Latest"] or sorted(
+        cl, key=lambda c: c.get("publishedAt") or "", reverse=True)
+    return latest[0]["id"] if latest else None
+
+
+def bc_version(code, cid):
+    d = bc_get(f"/engagements/{code}/changelog/{cid}.json")["data"]
+    brief = d.get("brief") or {}
+    rewards, excl = {}, []
+    for g in d.get("scope") or []:
+        if not g.get("inScope"):
+            continue
+        for prio, r in (g.get("rewardRangeData") or {}).items():
+            name = g.get("name") or "group"
+            if isinstance(r, dict) and r.get("max"):
+                rewards[f"{name}.P{prio}"] = float(r["max"])
+            elif isinstance(r, (int, float)) and r:  # e.g. "programMax": 10000
+                rewards[f"{name}.{prio}"] = float(r)
+    for rule in d.get("vrtScopeRules") or []:
+        where = "" if rule.get("allTargets") else " (some targets)"
+        for ids in (rule.get("vrtIds") or {}).values():
+            for v in ids if isinstance(ids, list) else []:
+                excl.append(f'{v.get("id", "").replace("_", " ")}: {rule.get("exclusionType", "")}{where}')
+    text = "\n".join(html_text(brief.get(k)) for k in ("description", "targetsOverview", "additionalInformation"))
+    return {"rules": text, "non_qualifying": sorted(set(excl)), "rewards": rewards,
+            "testing": {"safeHarbor": (brief.get("safeHarborStatus") or {}).get("status") or ""}}
+
+
+def bc_announcements(code):
+    return [{"id": a["id"], "title": a.get("title") or "", "body": html_text(a.get("body"))}
+            for a in bc_get(f"/engagements/{code}/announcements.json").get("announcements") or []]
+
+
+def bugcrowd_diff(state, programs, out):
+    """Checks a rotating slice of Bugcrowd programs (plus ones with feed changes this run) for a
+    new brief version and new announcements."""
+    if not DIRECT:
+        return
+    track = state.setdefault("bc", {})
+    policy = state["policy"]
+    keys = sorted(k for k, p in programs.items() if p["platform"] == "bugcrowd")
+    if not keys:
+        return
+    start = state.get("bc_cursor", 0) % len(keys)
+    rotation = (keys[start:] + keys[:start])[:BC_PER_RUN]
+    state["bc_cursor"] = start + len(rotation)
+    urgent = [k for k in keys if k not in track] + sorted({c["key"] for c in out if c["platform"] == "bugcrowd"})
+    todo = list(dict.fromkeys([k for k in urgent if k in programs][:BC_PER_RUN] + rotation))
+    for key in todo:
+        prog = programs[key]
+        code = prog["url"].rstrip("/").rsplit("/", 1)[1]
+        t = track.get(key, {})
+        try:
+            cid = bc_latest_changelog(code)
+            anns = bc_announcements(code)
+            pol = policy.get(key)
+            if cid and cid != t.get("changelog"):
+                pol = bc_version(code, cid)
+            time.sleep(0.3)
+        except Blocked as e:
+            WARNINGS.append(f"Bugcrowd answered {e} while checking briefs; skipped the rest this run. "
+                            f"If this repeats, lower BBWATCH_BC_PER_RUN.")
+            return
+        except Exception as e:
+            print(f"[!] bugcrowd {code}: {e}", file=sys.stderr)
+            continue
+        first = key not in track
+        if not first and wanted(prog):
+            if key in policy and pol is not policy[key]:
+                diff_policy(key, prog, policy[key], pol, out)
+            known = set(t.get("ann", []))
+            for a in anns:
+                if a["id"] not in known:
+                    text = f'{a["title"]}: {a["body"]}'
+                    out.add("ANNOUNCEMENT", key, prog, text[:300], is_ai(text), bool(BONUS_RE.search(text)))
+        if pol is not None:
+            policy[key] = pol
+        track[key] = {"changelog": cid, "ann": sorted(a["id"] for a in anns)}
+
+
 def list_note(n):
     notes = [x for x, on in (("login required", n["login"]), ("accept T&C first", n["tac"])) if on]
     if n.get("access") in IG_ACCESS_NOTES and n["access"] != "Registered":
@@ -1058,6 +1172,7 @@ def main():
         prog = new.get(key) or state["lists"].get(key)
         if prog and wanted(prog):
             diff_policy(key, prog, before, after, changes)
+    bugcrowd_diff(state, new, changes)
     for w in WARNINGS:
         changes.add("WARNING", "bbwatch", {"platform": "bbwatch", "name": "bbwatch needs attention",
                                            "url": "https://github.com/sinansinansi/bbwatch/settings/secrets/actions",
