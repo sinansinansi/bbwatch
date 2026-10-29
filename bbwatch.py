@@ -58,6 +58,7 @@ Stdlib only. Config through env vars:
   TELEGRAM_TOKEN / TELEGRAM_CHAT_ID   Telegram bot alerts (optional)
   BBWATCH_DIRECT       "0" to skip the direct platform APIs (default on, off with LOCAL_FEED)
 """
+import base64
 import difflib
 import json
 import os
@@ -511,12 +512,14 @@ def diff_policy(key, prog, o, n, out):
     def add(kind, detail, ai=False, bonus=False):
         out.add(kind, key, prog, detail[:300], ai, bonus)
 
-    old_nq, new_nq = set(o.get("non_qualifying", [])), set(n.get("non_qualifying", []))
+    # list fields only compare when both sides have them (H1 exclusions arrive gradually)
+    has = lambda f: f in o and f in n
+    old_nq, new_nq = (set(o["non_qualifying"]), set(n["non_qualifying"])) if has("non_qualifying") else (set(), set())
     for x in sorted(old_nq - new_nq):
         add("EXCLUSION_REMOVED", x, is_ai(x))
     for x in sorted(new_nq - old_nq):
         add("EXCLUSION_ADDED", x)
-    old_q, new_q = set(o.get("qualifying", [])), set(n.get("qualifying", []))
+    old_q, new_q = (set(o["qualifying"]), set(n["qualifying"])) if has("qualifying") else (set(), set())
     for x in sorted(new_q - old_q):
         add("QUALIFYING_ADDED", x, is_ai(x))
     for x in sorted(old_q - new_q):
@@ -665,6 +668,86 @@ def intigriti_programs(state, ig_list, now):
     return programs, policy_diffs
 
 
+# HackerOne Hacker API (API identifier + token, basic auth). The program list carries the full
+# policy text and the real open/paused status; the feed only lists open programs. Scope stays
+# from the feed (same data). Scope exclusions need one call per program, so they're refreshed
+# round-robin plus immediately for programs whose policy text changed.
+
+H1_API = "https://api.hackerone.com/v1/hackers"
+H1_USER, H1_TOKEN = os.environ.get("H1_USERNAME"), os.environ.get("H1_TOKEN")
+H1_EXCL_PER_RUN = int(os.environ.get("BBWATCH_H1_EXCLUSIONS_PER_RUN", "60"))
+H1_POLICIES = {}  # filled by list_hackerone for this run: key -> policy text
+
+
+def h1_api(url):
+    auth = base64.b64encode(f"{H1_USER}:{H1_TOKEN}".encode()).decode()
+    req = urllib.request.Request(url if url.startswith("http") else H1_API + url, headers={
+        "Authorization": f"Basic {auth}", "Accept": "application/json", "User-Agent": "bbwatch"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def list_hackerone():
+    out, url = {}, "/programs?page%5Bsize%5D=100"
+    H1_POLICIES.clear()
+    while url:
+        j = h1_api(url)
+        for p in j["data"]:
+            a = p["attributes"]
+            if a.get("state") != "public_mode":
+                continue
+            key = f'hackerone:{a["handle"]}'
+            out[key] = {
+                "platform": "hackerone", "name": a["name"], "handle": a["handle"],
+                "url": f'https://hackerone.com/{a["handle"]}',
+                "paid": bool(a.get("offers_bounties")), "max_bounty": None,
+                "open": a.get("submission_state") == "open",
+                "updated": "", "login": False, "tac": False,
+            }
+            H1_POLICIES[key] = a.get("policy") or ""
+        url = (j.get("links") or {}).get("next")
+    return out
+
+
+def h1_exclusions(handle):
+    cats, url = [], f"/programs/{handle}/scope_exclusions?page%5Bsize%5D=100"
+    while url:
+        j = h1_api(url)
+        cats += [e["attributes"].get("category") or "" for e in j["data"]]
+        url = (j.get("links") or {}).get("next")
+    return sorted({c for c in cats if c})
+
+
+def h1_policy_diff(state, new, out):
+    """Diffs H1 policy text for every listed program, and scope exclusions for a rotating
+    slice plus programs whose text just changed."""
+    policy = state["policy"]
+    changed_text = set()
+    for key in new:
+        text = H1_POLICIES.get(key, "")
+        prev = policy.get(key)
+        if prev is not None and prev.get("rules") != text:
+            changed_text.add(key)
+    keys = sorted(new)
+    start = state.get("h1_excl_cursor", 0) % max(len(keys), 1)
+    rotation = (keys[start:] + keys[:start])[:H1_EXCL_PER_RUN]
+    state["h1_excl_cursor"] = start + len(rotation)
+    refresh = changed_text | set(rotation)
+    for key in keys:
+        prev = policy.get(key)
+        pol = {"rules": H1_POLICIES.get(key, "")}
+        if prev and "non_qualifying" in prev:
+            pol["non_qualifying"] = prev["non_qualifying"]
+        if key in refresh:
+            try:
+                pol["non_qualifying"] = h1_exclusions(new[key]["handle"])
+            except Exception as e:
+                print(f"[!] hackerone exclusions {new[key]['handle']}: {e}", file=sys.stderr)
+        policy[key] = pol
+        if prev is not None and wanted(new[key]):
+            diff_policy(key, new[key], prev, pol, out)
+
+
 def list_note(n):
     notes = [x for x, on in (("login required", n["login"]), ("accept T&C first", n["tac"])) if on]
     if n.get("access") in IG_ACCESS_NOTES and n["access"] != "Registered":
@@ -686,11 +769,17 @@ def fetch_lists(state):
                 WARNINGS.append(f"Intigriti token failed ({e}). Using the public list until it's "
                                 f"fixed. Expired? Create a new token and update the INTIGRITI_TOKEN secret.")
                 return list_intigriti()
-    for plat, fn in (("intigriti", ig_fn), ("yeswehack", list_yeswehack)):
+    sources = [("intigriti", ig_fn), ("yeswehack", list_yeswehack)]
+    if H1_USER and H1_TOKEN:
+        sources.append(("hackerone", list_hackerone))
+    for plat, fn in sources:
         try:
             new = fn()
         except Exception as e:
             print(f"[!] {plat} list: {e}", file=sys.stderr)
+            if plat == "hackerone":
+                WARNINGS.append(f"HackerOne API failed ({e}). Policy and pause tracking for H1 is off "
+                                f"until it's fixed. Check the H1_USERNAME / H1_TOKEN secrets.")
             continue
         before = sum(1 for v in state["lists"].values() if v["platform"] == plat)
         if before >= 20 and len(new) < before * (1 - GLITCH_DROP):
@@ -749,6 +838,8 @@ def direct_diff(state, lists, out, now):
             del state["lists"][key]
         state["lists"].update(new)
 
+        if plat == "hackerone":
+            h1_policy_diff(state, new, out)
         if plat == "yeswehack":
             for key, n in new.items():
                 o = old.get(key)
