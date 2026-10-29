@@ -64,6 +64,7 @@ import os
 import re
 import sys
 import time
+import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -117,6 +118,8 @@ KINDS = {
     "QUALIFYING_REMOVED": (9, 1),
     "REWARD_DOWN": (9, 1),
     "PAUSED_OR_REMOVED": (9, 1),
+    "REOPENED_BRIEF": (10, 0),  # report file only
+    "WARNING": (0, 4),          # bbwatch itself needs attention
     "PAID_TO_VDP": (9, 1),
     "BOUNTY_DOWN": (9, 1),
     "ASSET_REMOVED": (9, 1),
@@ -125,6 +128,7 @@ KINDS = {
     "OOS_ADDED": (9, 1),
 }
 NEGATIVE = {k for k, (rank, _) in KINDS.items() if rank == 9}
+QUIET = {k for k, (rank, _) in KINDS.items() if rank == 10}
 
 
 # --------------------------------------------------------------------------- fetch
@@ -502,34 +506,169 @@ def added_lines(a, b):
 
 
 def diff_policy(key, prog, o, n, out):
+    """Policy dicts may carry: qualifying / non_qualifying (lists), rewards (cell -> amount),
+    rules / account_access (text), testing (setting -> value). Missing fields are skipped."""
     def add(kind, detail, ai=False, bonus=False):
         out.add(kind, key, prog, detail[:300], ai, bonus)
 
-    old_nq, new_nq = set(o["non_qualifying"]), set(n["non_qualifying"])
+    old_nq, new_nq = set(o.get("non_qualifying", [])), set(n.get("non_qualifying", []))
     for x in sorted(old_nq - new_nq):
         add("EXCLUSION_REMOVED", x, is_ai(x))
     for x in sorted(new_nq - old_nq):
         add("EXCLUSION_ADDED", x)
-    old_q, new_q = set(o["qualifying"]), set(n["qualifying"])
+    old_q, new_q = set(o.get("qualifying", [])), set(n.get("qualifying", []))
     for x in sorted(new_q - old_q):
         add("QUALIFYING_ADDED", x, is_ai(x))
     for x in sorted(old_q - new_q):
         add("QUALIFYING_REMOVED", x)
-    for cell in sorted(set(o["rewards"]) | set(n["rewards"])):
-        a, b = o["rewards"].get(cell, 0), n["rewards"].get(cell, 0)
+    o_rw, n_rw = o.get("rewards", {}), n.get("rewards", {})
+    for cell in sorted(set(o_rw) | set(n_rw)):
+        a, b = o_rw.get(cell, 0), n_rw.get(cell, 0)
         if a != b:
             add("REWARD_UP" if b > a else "REWARD_DOWN", f"{cell}: {a:g} -> {b:g}")
     for field in ("rules", "account_access"):
-        lines = added_lines(o[field], n[field])
+        lines = added_lines(o.get(field, ""), n.get(field, ""))
         if lines is None:
             continue
         detail = " | ".join(lines[:3]) if lines else "text removed or reworded"
         add("POLICY_CHANGED", f"{field}: {detail}",
             any(is_ai(l) for l in lines), any(BONUS_RE.search(l) for l in lines))
+    o_t, n_t = o.get("testing", {}), n.get("testing", {})
+    for k in sorted(set(o_t) | set(n_t)):
+        if o_t.get(k) != n_t.get(k):
+            add("POLICY_CHANGED", f'testing {k}: {o_t.get(k) or "-"} -> {n_t.get(k) or "-"}')
+
+
+# Intigriti researcher API (personal access token). Superset of the public list: adds
+# application/invite programs, full scope with tiers, rules of engagement, and an activity log
+# that says which programs got a new scope or rules version.
+
+IG_API = "https://api.intigriti.com/external/researcher/v1"
+IG_TOKEN = os.environ.get("INTIGRITI_TOKEN")
+IG_ACCESS_NOTES = {"Registered": "login required", "Application": "apply to join",
+                   "InviteOnly": "invite only"}
+IG_DENIED_RETRY = timedelta(hours=24)
+# Status flips shorter than this (report caps resetting) aren't pushed as REOPENED.
+REOPEN_MIN = timedelta(hours=float(os.environ.get("BBWATCH_REOPEN_MIN_HOURS", "72")))
+WARNINGS = []
+
+
+def ig_api(path):
+    req = urllib.request.Request(IG_API + path, headers={
+        "Authorization": f"Bearer {IG_TOKEN}", "Accept": "application/json", "User-Agent": "bbwatch"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def list_intigriti_api():
+    out, offset = {}, 0
+    while True:
+        j = ig_api(f"/programs?limit=500&offset={offset}")
+        for p in j["records"]:
+            m = re.search(r"/programs/([^/]+)/([^/]+)/detail", (p.get("webLinks") or {}).get("detail", ""))
+            if not m or p["status"]["id"] not in (IG_OPEN, IG_SUSPENDED):
+                continue
+            company, handle = m.groups()
+            top = _money(p.get("maxBounty"))
+            access = p["confidentialityLevel"]["value"]
+            out[f"intigriti:{company}/{handle}"] = {
+                "platform": "intigriti", "name": p["name"], "id": p["id"],
+                "url": f"https://www.intigriti.com/programs/{company}/{handle}/detail",
+                "paid": top > 0, "max_bounty": top, "open": p["status"]["id"] == IG_OPEN,
+                "updated": "", "login": access == "Registered", "tac": False, "access": access,
+            }
+        offset += len(j["records"])
+        if not j["records"] or offset >= j["maxCount"]:
+            return out
+
+
+def ig_changed_programs(since):
+    """Program ids with a new scope or rules version after `since` (epoch), and the newest
+    activity time seen."""
+    ids, newest, offset = set(), since, 0
+    while offset < 5000:
+        j = ig_api(f"/programs/activities?limit=100&offset={offset}")
+        for a in j["records"]:
+            if a["createdAt"] <= since:
+                return ids, newest
+            newest = max(newest, a["createdAt"])
+            if a["type"]["id"] != 3:  # 3 = status change; the list already covers status
+                ids.add(a["programId"])
+        offset += len(j["records"])
+        if not j["records"] or offset >= j["maxCount"]:
+            break
+    return ids, newest
+
+
+def ig_detail(pid):
+    d = ig_api(f"/programs/{pid}")
+    assets, oos = {}, []
+    for a in (d.get("domains") or {}).get("content") or []:
+        ep = (a.get("endpoint") or "").strip()
+        tier = (a.get("tier") or {}).get("value") or ""
+        if not ep:
+            continue
+        if tier.lower() == "out of scope":
+            oos.append(ep)
+            continue
+        bounty, t = _intigriti_tier(tier)
+        assets[ep] = _asset((a.get("type") or {}).get("value"), bounty, t)
+    roe = (d.get("rulesOfEngagement") or {}).get("content") or {}
+    testing = {k: str(v) for k, v in (roe.get("testingRequirements") or {}).items() if v not in (None, "")}
+    testing["safeHarbour"] = str(roe.get("safeHarbour"))
+    return assets, sorted(set(oos)), {"rules": roe.get("description") or "", "testing": testing}
+
+
+def intigriti_programs(state, ig_list, now):
+    """Builds Intigriti programs from the researcher API, re-fetching only programs that are
+    new, had scope/rules activity, or were access-denied over a day ago.
+    Returns ({key: program}, [(key, old_policy, new_policy)])."""
+    cache = state.setdefault("ig_detail", {})
+    policy = state["policy"]
+    since = state.get("ig_cursor", 0)
+    try:
+        changed, cursor = ig_changed_programs(since) if since else (set(), int(now.timestamp()))
+    except Exception as e:
+        print(f"[!] intigriti activities: {e}", file=sys.stderr)
+        changed, cursor = None, since  # unknown: refetch everything this run
+    policy_diffs = []
+    for key, n in ig_list.items():
+        c = cache.get(key)
+        stale = (c is None or changed is None or n["id"] in changed
+                 or (c.get("denied") and now - datetime.fromisoformat(c["fetched"]) > IG_DENIED_RETRY))
+        if not stale:
+            continue
+        try:
+            assets, oos, pol = ig_detail(n["id"])
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403, 404):  # no access yet (application/invite programs)
+                cache[key] = {"denied": True, "fetched": now.isoformat(timespec="seconds")}
+            else:
+                print(f"[!] intigriti detail {n['name']}: {e}", file=sys.stderr)
+            continue
+        except Exception as e:
+            print(f"[!] intigriti detail {n['name']}: {e}", file=sys.stderr)
+            continue
+        time.sleep(0.2)
+        cache[key] = {"assets": assets, "oos": oos, "fetched": now.isoformat(timespec="seconds")}
+        if key in policy:
+            policy_diffs.append((key, policy[key], pol))
+        policy[key] = pol
+    state["ig_cursor"] = cursor
+    programs = {}
+    for key, n in ig_list.items():
+        c = cache.get(key)
+        if c and not c.get("denied"):
+            programs[key] = {"platform": "intigriti", "name": n["name"], "url": n["url"],
+                             "paid": n["paid"], "max_bounty": n["max_bounty"],
+                             "assets": c["assets"], "oos": c["oos"]}
+    return programs, policy_diffs
 
 
 def list_note(n):
     notes = [x for x, on in (("login required", n["login"]), ("accept T&C first", n["tac"])) if on]
+    if n.get("access") in IG_ACCESS_NOTES and n["access"] != "Registered":
+        notes.append(IG_ACCESS_NOTES[n["access"]])
     return ", ".join(notes) or "from platform list"
 
 
@@ -538,7 +677,16 @@ def fetch_lists(state):
     if not DIRECT:
         return {}
     got = {}
-    for plat, fn in (("intigriti", list_intigriti), ("yeswehack", list_yeswehack)):
+    ig_fn = list_intigriti
+    if IG_TOKEN:
+        def ig_fn():
+            try:
+                return list_intigriti_api()
+            except Exception as e:
+                WARNINGS.append(f"Intigriti token failed ({e}). Using the public list until it's "
+                                f"fixed. Expired? Create a new token and update the INTIGRITI_TOKEN secret.")
+                return list_intigriti()
+    for plat, fn in (("intigriti", ig_fn), ("yeswehack", list_yeswehack)):
         try:
             new = fn()
         except Exception as e:
@@ -552,7 +700,7 @@ def fetch_lists(state):
     return got
 
 
-def direct_diff(state, lists, out):
+def direct_diff(state, lists, out, now):
     """Diffs the direct lists (and YesWeHack policies) into out. Mutates state."""
     seen = state["seen"]
     policy = state["policy"]
@@ -561,17 +709,25 @@ def direct_diff(state, lists, out):
     for plat, new in lists.items():
         old = {k: v for k, v in state["lists"].items() if v["platform"] == plat}
         first = not old  # first time we read this list: baseline silently
+        stamp = now.isoformat(timespec="seconds")
         for key, n in new.items():
             o = old.get(key)
             if o is None:
+                n["status_since"] = stamp
                 if not first and key not in seen and wanted(n):
                     out.add("NEW_PROGRAM", key, n, list_note(n), is_ai(n["name"]))
                 seen.add(key)
                 continue
+            n["status_since"] = o.get("status_since", stamp) if n["open"] == o["open"] else stamp
             if not (wanted(n) or wanted(o)):
                 continue
             if n["open"] and not o["open"]:
-                out.add("REOPENED", key, n, "status back to open")
+                since = o.get("status_since")
+                away = now - datetime.fromisoformat(since) if since else None
+                if away is not None and away >= REOPEN_MIN:
+                    out.add("REOPENED", key, n, f"back to open after {away.days} days suspended")
+                else:  # report-cap style flip: logged, not pushed
+                    out.add("REOPENED_BRIEF", key, n, "back to open after a short suspension")
             elif o["open"] and not n["open"]:
                 out.add("PAUSED", key, n, "suspended on the platform")
             if key not in feed:  # feed already diffs money for programs it lists
@@ -583,7 +739,7 @@ def direct_diff(state, lists, out):
                     up = n["max_bounty"] > o["max_bounty"]
                     out.add("BOUNTY_UP" if up else "BOUNTY_DOWN", key, n,
                             f'{o["max_bounty"]:g} -> {n["max_bounty"]:g}')
-            if plat == "intigriti" and n["open"] and n["updated"] != o["updated"]:
+            if plat == "intigriti" and n["open"] and n["updated"] and o["updated"] and n["updated"] != o["updated"]:
                 edited.append((key, n))
         if not first:
             for key, o in old.items():
@@ -619,6 +775,8 @@ def direct_diff(state, lists, out):
 # --------------------------------------------------------------------------- output
 
 def money(c):
+    if c["platform"] == "bbwatch":
+        return ""
     if not c["paid"]:
         return "VDP"
     return f'max {c["max_bounty"]:g}' if c["max_bounty"] else "bounty"
@@ -631,7 +789,7 @@ def tags(c):
 def fmt(c):
     tag = tags(c)
     detail = f' - {c["detail"]}' if c["detail"] else ""
-    name = c["name"] if money(c) in c["name"] else f'{c["name"]} ({money(c)})'
+    name = c["name"] if money(c) in c["name"] else f'{c["name"]} ({money(c)})'  # "" is always "in"
     return f'{tag}{c["kind"]} [{c["platform"]}] {name}{detail}\n    {c["url"]}'
 
 
@@ -682,7 +840,7 @@ def ntfy(changes):
 
     groups = {}
     for c in changes:
-        if c["kind"] not in NEGATIVE:
+        if c["kind"] not in NEGATIVE | QUIET:
             groups.setdefault(c["key"], []).append(c)  # changes are pre-sorted, so first = best
     items = list(groups.values())
     for group in items[:NTFY_MAX]:
@@ -716,7 +874,7 @@ def ntfy(changes):
 
 def alert(changes):
     ntfy(changes)
-    pos = [fmt(c) for c in changes if c["kind"] not in NEGATIVE]
+    pos = [fmt(c) for c in changes if c["kind"] not in NEGATIVE | QUIET]
     neg = [fmt(c) for c in changes if c["kind"] in NEGATIVE]
     lines = pos + (["--- negative ---"] + neg if neg else [])
     if not lines:
@@ -752,17 +910,42 @@ def main():
         return test_alert()
     now = datetime.now(timezone.utc)
     new, fetched = snapshot()
+    baseline = not STATE.exists()
+    state = ({"version": STATE_VERSION, "programs": {}, "gone": {}, "lists": {}, "policy": {},
+              "seen": set()} if baseline else load())
+    lists = fetch_lists(state)
+
+    # Intigriti from the researcher API (when the token works) instead of the feed. Switching
+    # source either way re-baselines Intigriti silently: the two sources list different programs.
+    ig_policy_diffs = []
+    ig_source = "feed"
+    if IG_TOKEN and "intigriti" in lists and any("id" in v for v in lists["intigriti"].values()):
+        ig_programs, ig_policy_diffs = intigriti_programs(state, lists["intigriti"], now)
+        if ig_programs:
+            ig_source = "api"
+            new = {k: v for k, v in new.items() if v["platform"] != "intigriti"}
+            new.update(ig_programs)
+            fetched.add("intigriti")
+    if state.get("ig_source", "feed") != ig_source and not baseline:
+        print(f"[*] intigriti source {state.get('ig_source', 'feed')} -> {ig_source}: re-baselining")
+        state["programs"] = {k: v for k, v in state["programs"].items() if v["platform"] != "intigriti"}
+        state["programs"].update({k: v for k, v in new.items() if v["platform"] == "intigriti"})
+        state["gone"] = {k: v for k, v in state["gone"].items() if not k.startswith("intigriti:")}
+        state["lists"] = {k: v for k, v in state["lists"].items() if v["platform"] != "intigriti"}
+        state["seen"] |= {k for k, v in new.items() if v["platform"] == "intigriti"}
+        ig_policy_diffs = []
+    state["ig_source"] = ig_source
+
     if not new:
         sys.exit("[!] no data fetched")
-    if not STATE.exists():
-        state = {"version": STATE_VERSION, "programs": new, "gone": {}, "lists": {}, "policy": {},
-                 "seen": set(new)}
-        direct_diff(state, fetch_lists(state), Changes())  # baseline lists + policies silently
+    if baseline:
+        state["programs"] = new
+        state["seen"] = set(new)
+        direct_diff(state, lists, Changes(), now)  # baseline lists + policies silently
         save(state)
         print(f"[+] baseline saved: {len(new)} programs, {len(state['lists'])} listed, "
               f"{len(state['policy'])} policies. Next run reports changes.")
         return
-    state = load()
     old = state["programs"]
 
     # A platform that failed, or whose program count collapsed (feed glitch), keeps its old
@@ -777,10 +960,17 @@ def main():
         if plat not in fetched:
             new.update({k: v for k, v in old.items() if v["platform"] == plat})
 
-    lists = fetch_lists(state)
     changes = diff(state, new, fetched, now, authoritative=frozenset(lists))
     state["programs"] = new
-    direct_diff(state, lists, changes)
+    direct_diff(state, lists, changes, now)
+    for key, before, after in ig_policy_diffs:
+        prog = new.get(key) or state["lists"].get(key)
+        if prog and wanted(prog):
+            diff_policy(key, prog, before, after, changes)
+    for w in WARNINGS:
+        changes.add("WARNING", "bbwatch", {"platform": "bbwatch", "name": "bbwatch needs attention",
+                                           "url": "https://github.com/sinansinansi/bbwatch/settings/secrets/actions",
+                                           "paid": True, "max_bounty": None}, w)
     sort_changes(changes)
     save(state)
     if not changes:

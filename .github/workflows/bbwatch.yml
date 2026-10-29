@@ -23,6 +23,7 @@ jobs:
     timeout-minutes: 10
     env:
       NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+      INTIGRITI_TOKEN: ${{ secrets.INTIGRITI_TOKEN }}
       DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
       TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
